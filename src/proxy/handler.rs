@@ -148,6 +148,28 @@ impl HttpHandler for RoxyHandler {
         // Get client IP
         let client_ip = ctx.client_addr.ip().to_string();
 
+        // For CONNECT requests (HTTPS tunnel establishment), skip rule evaluation.
+        // Rules will be evaluated on the actual HTTP request inside the tunnel.
+        // This allows path-based rules to work correctly for HTTPS traffic.
+        if method == Method::CONNECT {
+            info!(
+                target: "proxy",
+                method = %method,
+                host = %host,
+                action = "tunnel",
+                "Establishing HTTPS tunnel (rule evaluation will happen on inner request)"
+            );
+            return req.into();
+        }
+
+        debug!(
+            target: "proxy",
+            method = %method,
+            host = %host,
+            path = %path,
+            "Processing request"
+        );
+
         // Build evaluation context
         let eval_ctx =
             Self::build_eval_context(&host, &path, method.clone(), &headers, Some(&client_ip));
@@ -155,6 +177,8 @@ impl HttpHandler for RoxyHandler {
         // Evaluate rules
         let result = self.rules.evaluate(&eval_ctx);
         let mangle_rules = self.rules.evaluate_mangle_rules(&eval_ctx);
+
+        debug!(target: "rules", ?result, "Rule evaluation result");
 
         // Process rule result
         match result {

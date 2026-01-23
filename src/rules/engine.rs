@@ -380,4 +380,49 @@ mod tests {
         let index = RuleIndex::from_config(&configs).unwrap();
         assert_eq!(index.rule_count(), 2);
     }
+
+    #[test]
+    fn test_method_and_path_rule_before_catchall() {
+        // Exact scenario from user: method(GET) && path("/health") before host("*") = block
+        let rules = vec![
+            RuleConfig {
+                name: "allow-healthcheck".to_string(),
+                rule: r#"path("/health") && method(GET) = pass"#.to_string(),
+            },
+            RuleConfig {
+                name: "block-all".to_string(),
+                rule: r#"host("*") = block"#.to_string(),
+            },
+        ];
+
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let headers = HashMap::new();
+
+        // GET /health should pass (rule 1)
+        let ctx = make_ctx("example.com", "/health", Method::GET, &headers);
+        let result = index.evaluate(&ctx);
+        assert!(
+            matches!(&result, RuleResult::Pass { rule_name } if rule_name == "allow-healthcheck"),
+            "Expected Pass from allow-healthcheck, got {:?}",
+            result
+        );
+
+        // POST /health should be blocked (rule 1 requires GET)
+        let ctx = make_ctx("example.com", "/health", Method::POST, &headers);
+        let result = index.evaluate(&ctx);
+        assert!(
+            matches!(&result, RuleResult::Block { rule_name } if rule_name == "block-all"),
+            "Expected Block from block-all, got {:?}",
+            result
+        );
+
+        // GET /other should be blocked
+        let ctx = make_ctx("example.com", "/other", Method::GET, &headers);
+        let result = index.evaluate(&ctx);
+        assert!(
+            matches!(&result, RuleResult::Block { rule_name } if rule_name == "block-all"),
+            "Expected Block from block-all, got {:?}",
+            result
+        );
+    }
 }
