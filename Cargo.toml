@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # MITM HTTP/S proxy framework
-hudsucker = { version = "0.24", features = ["rcgen-ca"] }
+hudsucker = { version = "0.24", features = ["rcgen-ca", "http2"] }
 
 # Async runtime (hudsucker uses tokio)
 tokio = { version = "1", features = ["full", "signal"] }
