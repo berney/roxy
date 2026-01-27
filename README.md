@@ -337,6 +337,29 @@ RUST_LOG=debug ./target/release/roxy --config config.yaml
 RUST_LOG=roxy::rules=debug,roxy::proxy=info ./target/release/roxy --config config.yaml
 ```
 
+### Smart Header Logging
+
+When a rule uses **existence-only header checks** (e.g., `header("X-Customer-Id")` without a value), Roxy automatically logs the actual header value when the rule matches. This is useful for observability without cluttering logs when headers aren't relevant to the rule.
+
+**Example rule:**
+```yaml
+rules:
+  - name: "track-customer"
+    rule: 'header("X-Customer-Id") && path("/api/*") = pass'
+```
+
+**Log output:**
+```json
+{"method":"GET","host":"api.example.com","path":"/api/users","rule":"track-customer","action":"forward","headers":{"X-Customer-Id":"cust-12345"}}
+```
+
+**What gets logged:**
+- `header("X-Name")` - existence check → **value is logged**
+- `header("X-Name:value")` - value match → **not logged** (value is already in the rule)
+- Multiple headers in a rule → all existence-only headers are logged
+
+This only adds overhead when headers are actually checked, and the values appear in the single `forward` log line.
+
 ## License
 
 MIT

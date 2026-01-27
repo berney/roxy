@@ -141,9 +141,41 @@ impl CompiledRule {
             _ => None,
         }
     }
+
+    /// Extract header names that are existence-only checks (no value matcher).
+    /// These headers will be logged when the rule matches.
+    pub fn extract_logged_headers(&self) -> Vec<String> {
+        self.condition.collect_existence_headers()
+    }
 }
 
 impl Expr {
+    /// Collect header names that are existence-only checks (value is None).
+    /// Recursively traverses the expression tree.
+    pub fn collect_existence_headers(&self) -> Vec<String> {
+        let mut headers = Vec::new();
+        self.collect_existence_headers_recursive(&mut headers);
+        headers
+    }
+
+    fn collect_existence_headers_recursive(&self, headers: &mut Vec<String>) {
+        match self {
+            Expr::Header { name, value: None } => {
+                // Only collect headers that are existence checks (no value matcher)
+                headers.push(name.clone());
+            }
+            Expr::Not(inner) => {
+                inner.collect_existence_headers_recursive(headers);
+            }
+            Expr::And(left, right) | Expr::Or(left, right) => {
+                left.collect_existence_headers_recursive(headers);
+                right.collect_existence_headers_recursive(headers);
+            }
+            // Host, Path, Method, Header with value don't contribute
+            _ => {}
+        }
+    }
+
     /// Evaluate expression against request data.
     pub fn evaluate(&self, ctx: &EvalContext) -> bool {
         match self {
@@ -305,6 +337,97 @@ mod tests {
             client_ip: None,
         };
         assert!(expr.evaluate(&ctx)); // !false = true
+    }
+
+    #[test]
+    fn test_collect_existence_headers_simple() {
+        // Single existence check
+        let expr = Expr::Header {
+            name: "X-Auth".to_string(),
+            value: None,
+        };
+        let headers = expr.collect_existence_headers();
+        assert_eq!(headers, vec!["X-Auth".to_string()]);
+    }
+
+    #[test]
+    fn test_collect_existence_headers_with_value_ignored() {
+        // Header with value match should NOT be collected
+        let expr = Expr::Header {
+            name: "X-Auth".to_string(),
+            value: Some(HeaderMatch::Exact("secret".to_string())),
+        };
+        let headers = expr.collect_existence_headers();
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_collect_existence_headers_and_expr() {
+        // AND with two existence checks
+        let expr = Expr::And(
+            Box::new(Expr::Header {
+                name: "X-Auth".to_string(),
+                value: None,
+            }),
+            Box::new(Expr::Header {
+                name: "X-Customer-Id".to_string(),
+                value: None,
+            }),
+        );
+        let headers = expr.collect_existence_headers();
+        assert_eq!(headers.len(), 2);
+        assert!(headers.contains(&"X-Auth".to_string()));
+        assert!(headers.contains(&"X-Customer-Id".to_string()));
+    }
+
+    #[test]
+    fn test_collect_existence_headers_mixed() {
+        // Mix of existence check and value match - only existence collected
+        let expr = Expr::And(
+            Box::new(Expr::Header {
+                name: "X-Auth".to_string(),
+                value: Some(HeaderMatch::Exact("token".to_string())),
+            }),
+            Box::new(Expr::Header {
+                name: "X-Request-Id".to_string(),
+                value: None,
+            }),
+        );
+        let headers = expr.collect_existence_headers();
+        assert_eq!(headers, vec!["X-Request-Id".to_string()]);
+    }
+
+    #[test]
+    fn test_collect_existence_headers_nested() {
+        // Nested: (host && header) || !header
+        let expr = Expr::Or(
+            Box::new(Expr::And(
+                Box::new(Expr::Host(make_glob("*.com"))),
+                Box::new(Expr::Header {
+                    name: "X-First".to_string(),
+                    value: None,
+                }),
+            )),
+            Box::new(Expr::Not(Box::new(Expr::Header {
+                name: "X-Second".to_string(),
+                value: None,
+            }))),
+        );
+        let headers = expr.collect_existence_headers();
+        assert_eq!(headers.len(), 2);
+        assert!(headers.contains(&"X-First".to_string()));
+        assert!(headers.contains(&"X-Second".to_string()));
+    }
+
+    #[test]
+    fn test_collect_existence_headers_no_headers() {
+        // Expression with no header checks
+        let expr = Expr::And(
+            Box::new(Expr::Host(make_glob("*.com"))),
+            Box::new(Expr::Path(make_glob("/api/*"))),
+        );
+        let headers = expr.collect_existence_headers();
+        assert!(headers.is_empty());
     }
 
     #[test]

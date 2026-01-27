@@ -78,6 +78,11 @@ impl RoxyHandler {
         for (name, value) in req.headers().iter() {
             if let Ok(v) = value.to_str() {
                 headers.insert(name.as_str().to_lowercase(), v.to_string());
+            } else {
+                // Header contains non-ASCII bytes, use lossy conversion
+                let v = String::from_utf8_lossy(value.as_bytes()).to_string();
+                debug!(target: "proxy", header = %name, "Header contains non-UTF8 bytes, using lossy conversion");
+                headers.insert(name.as_str().to_lowercase(), v);
             }
         }
         headers
@@ -152,7 +157,7 @@ impl HttpHandler for RoxyHandler {
         // Rules will be evaluated on the actual HTTP request inside the tunnel.
         // This allows path-based rules to work correctly for HTTPS traffic.
         if method == Method::CONNECT {
-            info!(
+            debug!(
                 target: "proxy",
                 method = %method,
                 host = %host,
@@ -180,43 +185,75 @@ impl HttpHandler for RoxyHandler {
 
         debug!(target: "rules", ?result, "Rule evaluation result");
 
-        // Process rule result
+        // Process rule result - collect info for single log at forward time
+        let mut matched_rule: Option<String> = None;
+        let mut matched_headers: HashMap<String, String> = HashMap::new();
+
         match result {
             RuleResult::NoMatch => {
                 debug!(target: "rules", "No rules matched");
             }
-            RuleResult::Block { rule_name } => {
-                info!(target: "proxy", rule = %rule_name, action = "block", status = 403);
-                return Self::error_response(StatusCode::FORBIDDEN, "Forbidden by proxy rule")
-                    .into();
+            RuleResult::Block {
+                rule_name,
+                logged_headers,
+            } => {
+                info!(
+                    target: "proxy",
+                    method = %method,
+                    host = %host,
+                    path = %path,
+                    rule = %rule_name,
+                    action = "block",
+                    status = 403,
+                    headers = ?logged_headers
+                );
+                return Self::error_response(StatusCode::FORBIDDEN, "Not Allowed").into();
             }
-            RuleResult::Pass { rule_name } => {
+            RuleResult::Pass {
+                rule_name,
+                logged_headers,
+            } => {
                 debug!(target: "rules", rule = %rule_name, action = "pass");
+                matched_rule = Some(rule_name);
+                matched_headers = logged_headers;
             }
-            RuleResult::Mangle { rule_name } => {
+            RuleResult::Mangle {
+                rule_name,
+                logged_headers,
+            } => {
                 debug!(target: "rules", rule = %rule_name, action = "mangle");
-                // Mangle rules collected separately below
+                matched_rule = Some(rule_name);
+                matched_headers = logged_headers;
             }
             RuleResult::RateLimit {
                 rule_name,
                 requests,
                 window_secs,
                 key_expr,
-            } => {
-                match self.check_rate_limit(&key_expr, requests, window_secs, &eval_ctx) {
-                    Ok(RateLimitResult::Allowed { remaining }) => {
-                        debug!(target: "ratelimit", rule = %rule_name, remaining = remaining);
-                    }
-                    Ok(RateLimitResult::Limited { retry_after_secs }) => {
-                        warn!(target: "ratelimit", rule = %rule_name, action = "limited");
-                        return Self::rate_limit_response(retry_after_secs).into();
-                    }
-                    Err(e) => {
-                        warn!(target: "ratelimit", error = %e, "Rate limit key extraction failed");
-                        // Continue without rate limiting if key extraction fails
-                    }
+                logged_headers,
+            } => match self.check_rate_limit(&key_expr, requests, window_secs, &eval_ctx) {
+                Ok(RateLimitResult::Allowed { remaining }) => {
+                    debug!(target: "ratelimit", rule = %rule_name, remaining);
+                    matched_rule = Some(rule_name);
+                    matched_headers = logged_headers;
                 }
-            }
+                Ok(RateLimitResult::Limited { retry_after_secs }) => {
+                    info!(
+                        target: "proxy",
+                        method = %method,
+                        host = %host,
+                        path = %path,
+                        rule = %rule_name,
+                        action = "rate_limited",
+                        status = 429,
+                        headers = ?logged_headers
+                    );
+                    return Self::rate_limit_response(retry_after_secs).into();
+                }
+                Err(e) => {
+                    warn!(target: "ratelimit", error = %e, "Rate limit key extraction failed");
+                }
+            },
         }
 
         // Apply header modifications for matched mangle rules
@@ -257,14 +294,39 @@ impl HttpHandler for RoxyHandler {
             }
         }
 
-        // Log the forwarded request
-        info!(
-            target: "proxy",
-            method = %method,
-            host = %host,
-            path = %path,
-            action = "forward"
-        );
+        // Log the forwarded request (single info log per request)
+        match (&matched_rule, matched_headers.is_empty()) {
+            (Some(rule), true) => {
+                info!(
+                    target: "proxy",
+                    method = %method,
+                    host = %host,
+                    path = %path,
+                    rule = %rule,
+                    action = "forward"
+                );
+            }
+            (Some(rule), false) => {
+                info!(
+                    target: "proxy",
+                    method = %method,
+                    host = %host,
+                    path = %path,
+                    rule = %rule,
+                    action = "forward",
+                    headers = ?matched_headers
+                );
+            }
+            (None, _) => {
+                info!(
+                    target: "proxy",
+                    method = %method,
+                    host = %host,
+                    path = %path,
+                    action = "forward"
+                );
+            }
+        }
 
         // Reconstruct request and forward
         Request::from_parts(parts, body).into()
