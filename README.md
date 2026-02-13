@@ -1,4 +1,7 @@
+
 # Roxy
+
+![](./logo.png)
 
 [![Docker Hub](https://img.shields.io/docker/v/adsanz/roxy?label=Docker%20Hub)](https://hub.docker.com/r/adsanz/roxy)
 
