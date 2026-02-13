@@ -248,7 +248,7 @@ impl HttpHandler for RoxyHandler {
 
         // Evaluate rules
         let result = self.rules.evaluate(&eval_ctx);
-        let mangle_rules = self.rules.evaluate_mangle_rules(&eval_ctx);
+        let mut mangle_rules = self.rules.evaluate_mangle_rules(&eval_ctx);
 
         debug!(target: "rules", ?result, "Rule evaluation result");
 
@@ -297,6 +297,7 @@ impl HttpHandler for RoxyHandler {
                 requests,
                 window_secs,
                 key_expr,
+                mangle,
                 logged_headers,
             } => {
                 // IP baseline check: prevent bypass by varying header values
@@ -328,6 +329,9 @@ impl HttpHandler for RoxyHandler {
                         } else {
                             debug!(target: "ratelimit", rule = %rule_name, remaining);
                         }
+                        if mangle {
+                            mangle_rules.push(rule_name.clone());
+                        }
                         matched_rule = Some(rule_name);
                         matched_headers = logged_headers;
                     }
@@ -351,6 +355,7 @@ impl HttpHandler for RoxyHandler {
                 credits: _,
                 period: _,
                 key_expr,
+                mangle,
                 logged_headers,
             } => {
                 let key = extract_key(&key_expr, &eval_ctx)
@@ -359,6 +364,9 @@ impl HttpHandler for RoxyHandler {
                 match result {
                     CreditResult::Allowed { remaining } => {
                         debug!(target: "credit", rule = %rule_name, remaining);
+                        if mangle {
+                            mangle_rules.push(rule_name.clone());
+                        }
                         matched_rule = Some(rule_name);
                         matched_headers = logged_headers;
                     }
@@ -368,6 +376,9 @@ impl HttpHandler for RoxyHandler {
                     } => {
                         debug!(target: "credit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        if mangle {
+                            mangle_rules.push(rule_name.clone());
+                        }
                         matched_rule = Some(rule_name);
                         matched_headers = logged_headers;
                     }
@@ -401,6 +412,7 @@ impl HttpHandler for RoxyHandler {
                 credits: _,
                 period: _,
                 credit_key_expr,
+                mangle,
                 logged_headers,
             } => {
                 // Step 0: IP baseline check (prevents header-flooding bypass)
@@ -478,6 +490,9 @@ impl HttpHandler for RoxyHandler {
                                 debug!(target: "proxy", rule = %rule_name, credit_delay, rl_delay, max_delay, "Composite throttle");
                                 tokio::time::sleep(std::time::Duration::from_millis(max_delay))
                                     .await;
+                                if mangle {
+                                    mangle_rules.push(rule_name.clone());
+                                }
                                 matched_rule = Some(rule_name);
                                 matched_headers = logged_headers;
                             }
@@ -488,6 +503,9 @@ impl HttpHandler for RoxyHandler {
                                     debug!(target: "ratelimit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
                                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                                         .await;
+                                }
+                                if mangle {
+                                    mangle_rules.push(rule_name.clone());
                                 }
                                 matched_rule = Some(rule_name);
                                 matched_headers = logged_headers;

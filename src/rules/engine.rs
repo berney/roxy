@@ -44,6 +44,8 @@ pub enum RuleResult {
         requests: u64,
         window_secs: u64,
         key_expr: KeyExpr,
+        /// Also apply header mangling for this rule
+        mangle: bool,
         /// Headers to log (existence-only checks with their values)
         logged_headers: HashMap<String, String>,
     },
@@ -54,6 +56,8 @@ pub enum RuleResult {
         credits: u64,
         period: CreditPeriod,
         key_expr: KeyExpr,
+        /// Also apply header mangling for this rule
+        mangle: bool,
         /// Headers to log (existence-only checks with their values)
         logged_headers: HashMap<String, String>,
     },
@@ -67,6 +71,8 @@ pub enum RuleResult {
         credits: u64,
         period: CreditPeriod,
         credit_key_expr: KeyExpr,
+        /// Also apply header mangling for this rule
+        mangle: bool,
         /// Headers to log (existence-only checks with their values)
         logged_headers: HashMap<String, String>,
     },
@@ -239,22 +245,26 @@ impl RuleIndex {
                 requests,
                 window_secs,
                 key_expr,
+                mangle,
             } => RuleResult::RateLimit {
                 rule_name: rule_name.to_string(),
                 requests: *requests,
                 window_secs: *window_secs,
                 key_expr: key_expr.clone(),
+                mangle: *mangle,
                 logged_headers,
             },
             Action::Credit {
                 credits,
                 period,
                 key_expr,
+                mangle,
             } => RuleResult::Credit {
                 rule_name: rule_name.to_string(),
                 credits: *credits,
                 period: *period,
                 key_expr: key_expr.clone(),
+                mangle: *mangle,
                 logged_headers,
             },
             Action::RateLimitCredit {
@@ -264,6 +274,7 @@ impl RuleIndex {
                 credits,
                 period,
                 credit_key_expr,
+                mangle,
             } => RuleResult::RateLimitCredit {
                 rule_name: rule_name.to_string(),
                 requests: *requests,
@@ -272,6 +283,7 @@ impl RuleIndex {
                 credits: *credits,
                 period: *period,
                 credit_key_expr: credit_key_expr.clone(),
+                mangle: *mangle,
                 logged_headers,
             },
         }
@@ -647,6 +659,98 @@ mod tests {
             budgets
                 .iter()
                 .any(|(name, budget)| name == "composite" && *budget == 2000)
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_with_mangle_result() {
+        let mut index = RuleIndex::new();
+
+        let rule = parse_rule(
+            "rl-mangle",
+            r#"host("api.*") = rate_limit(100/s, ip) + mangle"#,
+        )
+        .unwrap();
+        index.add_rule(rule);
+
+        let headers = HashMap::new();
+        let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
+
+        let result = index.evaluate(&ctx);
+        assert!(
+            matches!(&result, RuleResult::RateLimit { rule_name, mangle, .. }
+                if rule_name == "rl-mangle" && *mangle),
+            "Expected RateLimit with mangle=true, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_credit_with_mangle_result() {
+        let mut index = RuleIndex::new();
+
+        let rule = parse_rule(
+            "credit-mangle",
+            r#"host("api.*") = credit(1000/d, ip) + mangle"#,
+        )
+        .unwrap();
+        index.add_rule(rule);
+
+        let headers = HashMap::new();
+        let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
+
+        let result = index.evaluate(&ctx);
+        assert!(
+            matches!(&result, RuleResult::Credit { rule_name, mangle, .. }
+                if rule_name == "credit-mangle" && *mangle),
+            "Expected Credit with mangle=true, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_credit_mangle_result() {
+        let mut index = RuleIndex::new();
+
+        let rule = parse_rule(
+            "combo-mangle",
+            r#"host("api.*") = rate_limit(100/s, ip) + credit(1000/d, ip) + mangle"#,
+        )
+        .unwrap();
+        index.add_rule(rule);
+
+        let headers = HashMap::new();
+        let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
+
+        let result = index.evaluate(&ctx);
+        assert!(
+            matches!(&result, RuleResult::RateLimitCredit { rule_name, mangle, .. }
+                if rule_name == "combo-mangle" && *mangle),
+            "Expected RateLimitCredit with mangle=true, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_without_mangle_result() {
+        let mut index = RuleIndex::new();
+
+        let rule = parse_rule(
+            "rl-only",
+            r#"host("api.*") = rate_limit(100/s, ip)"#,
+        )
+        .unwrap();
+        index.add_rule(rule);
+
+        let headers = HashMap::new();
+        let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
+
+        let result = index.evaluate(&ctx);
+        assert!(
+            matches!(&result, RuleResult::RateLimit { rule_name, mangle, .. }
+                if rule_name == "rl-only" && !*mangle),
+            "Expected RateLimit with mangle=false, got {:?}",
+            result
         );
     }
 

@@ -236,6 +236,9 @@ With this config:
 | `rate_limit(N/unit, key)` | Sliding window rate limiting (units: `s`, `m`, `h`) |
 | `credit(N/period, key)` | Credit-based rate limiting (periods: `d`, `w`, `M`) |
 | `rate_limit(...) + credit(...)` | Composite: burst protection + budget enforcement |
+| `rate_limit(...) + mangle` | Rate limit + header mangling |
+| `credit(...) + mangle` | Credit check + header mangling |
+| `rate_limit(...) + credit(...) + mangle` | Full composite: burst + budget + header mangling |
 
 **Ternary syntax:** `condition = action_if_true : action_if_false`
 
@@ -278,12 +281,27 @@ Without throttle config, rate_limit rules: allow under the limit, reject (429) o
 
 ### Composite Actions
 
-Since rules use first-match-wins, you can't have separate `rate_limit` and `credit` rules on the same host/path. Use the `+` operator to combine them into a single rule:
+Since rules use first-match-wins, you can't have separate `rate_limit` and `credit` rules on the same host/path. Use the `+` operator to combine them into a single rule.
+
+The composable actions are `rate_limit`, `credit`, and `mangle`. The `+` operator supports 2 or 3 terms in any order:
 
 ```yaml
 rules:
+  # Rate limit + credit (burst + budget)
   - name: "api-protected"
     rule: 'host("api.*") && path("/v3/*") = rate_limit(50/s, header(X-Customer-Id)) + credit(5000/d, header(X-Customer-Id))'
+
+  # Rate limit + mangle (rate limit + header modification)
+  - name: "api-mangled"
+    rule: 'host("api.*") = rate_limit(100/s, ip) + mangle'
+
+  # Credit + mangle (budget + header modification)
+  - name: "budget-mangled"
+    rule: 'host("api.*") = credit(1000/d, header(X-Id)) + mangle'
+
+  # All three: rate limit + credit + mangle
+  - name: "full-composite"
+    rule: 'host("api.*") = rate_limit(50/s, ip) + credit(5000/d, header(X-Id)) + mangle'
 ```
 
 **Semantics:**
@@ -291,8 +309,11 @@ rules:
 2. If rate limit passes, credit is checked (budget enforcement)
 3. Both must pass for the request to proceed
 4. If both have soft limits configured, the **maximum** delay from either system applies
+5. If `mangle` is included, header modifications are applied on success (not on 429 rejections)
 
-The order (`rate_limit + credit` or `credit + rate_limit`) doesn't matter — rate limit is always evaluated first.
+The order of terms doesn't matter — rate limit is always evaluated before credit, and mangle is applied last.
+
+`block`, `pass`, and `mangle` (standalone) cannot be combined with other actions via `+`.
 
 Throttle and credit configs reference the same rule name:
 

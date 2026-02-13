@@ -84,6 +84,8 @@ pub enum Action {
         window_secs: u64,
         /// Key extractor expression
         key_expr: KeyExpr,
+        /// Also apply header mangling for this rule
+        mangle: bool,
     },
 
     /// Credit-based rate limiting with fixed budget and scheduled reset
@@ -94,6 +96,8 @@ pub enum Action {
         period: CreditPeriod,
         /// Key extractor expression
         key_expr: KeyExpr,
+        /// Also apply header mangling for this rule
+        mangle: bool,
     },
 
     /// Composite: rate limit (burst) + credit (budget) on the same rule
@@ -110,6 +114,8 @@ pub enum Action {
         period: CreditPeriod,
         /// Credit: key extractor
         credit_key_expr: KeyExpr,
+        /// Also apply header mangling for this rule
+        mangle: bool,
     },
 }
 
