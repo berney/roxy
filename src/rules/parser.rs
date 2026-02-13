@@ -148,15 +148,33 @@ fn parse_rule_internal(input: &str) -> RResult<'_, (Expr, Action, Option<Action>
     Ok((input, (condition, action, else_action)))
 }
 
+/// Maximum nesting depth for expressions to prevent unbounded recursion in malicious rules.
+const MAX_EXPR_DEPTH: usize = 32;
+
 /// Parse an expression (handles OR at lowest precedence)
 fn parse_expr(input: &str) -> RResult<'_, Expr> {
-    parse_or_expr(input)
+    parse_expr_depth(input, 0)
+}
+
+/// Depth-limited expression parser; returns error when nesting exceeds
+/// `MAX_EXPR_DEPTH`.
+fn parse_expr_depth(input: &str, depth: usize) -> RResult<'_, Expr> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(nom::Err::Failure(RuleParseError {
+            input,
+            kind: RuleParseErrorKind::InvalidValue {
+                detail: format!("expression nesting exceeds maximum depth of {MAX_EXPR_DEPTH}"),
+            },
+        }));
+    }
+    parse_or_expr(input, depth)
 }
 
 /// Parse OR expression: and_expr (|| and_expr)*
-fn parse_or_expr(input: &str) -> RResult<'_, Expr> {
-    let (input, first) = parse_and_expr(input)?;
-    let (input, rest) = nom::multi::many0(preceded(ws(tag("||")), parse_and_expr))(input)?;
+fn parse_or_expr(input: &str, depth: usize) -> RResult<'_, Expr> {
+    let (input, first) = parse_and_expr(input, depth)?;
+    let (input, rest) =
+        nom::multi::many0(preceded(ws(tag("||")), |i| parse_and_expr(i, depth)))(input)?;
 
     Ok((
         input,
@@ -166,9 +184,10 @@ fn parse_or_expr(input: &str) -> RResult<'_, Expr> {
 }
 
 /// Parse AND expression: unary_expr (&& unary_expr)*
-fn parse_and_expr(input: &str) -> RResult<'_, Expr> {
-    let (input, first) = parse_unary_expr(input)?;
-    let (input, rest) = nom::multi::many0(preceded(ws(tag("&&")), parse_unary_expr))(input)?;
+fn parse_and_expr(input: &str, depth: usize) -> RResult<'_, Expr> {
+    let (input, first) = parse_unary_expr(input, depth)?;
+    let (input, rest) =
+        nom::multi::many0(preceded(ws(tag("&&")), |i| parse_unary_expr(i, depth)))(input)?;
 
     Ok((
         input,
@@ -178,19 +197,32 @@ fn parse_and_expr(input: &str) -> RResult<'_, Expr> {
 }
 
 /// Parse unary expression: !primary | primary
-fn parse_unary_expr(input: &str) -> RResult<'_, Expr> {
+fn parse_unary_expr(input: &str, depth: usize) -> RResult<'_, Expr> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(nom::Err::Failure(RuleParseError {
+            input,
+            kind: RuleParseErrorKind::InvalidValue {
+                detail: format!("expression nesting exceeds maximum depth of {MAX_EXPR_DEPTH}"),
+            },
+        }));
+    }
     alt((
-        map(preceded(ws(char('!')), parse_unary_expr), |e| {
-            Expr::Not(Box::new(e))
-        }),
-        parse_primary_expr,
+        map(
+            preceded(ws(char('!')), |i| parse_unary_expr(i, depth + 1)),
+            |e| Expr::Not(Box::new(e)),
+        ),
+        |i| parse_primary_expr(i, depth),
     ))(input)
 }
 
 /// Parse primary expression: (expr) | function_call
-fn parse_primary_expr(input: &str) -> RResult<'_, Expr> {
+fn parse_primary_expr(input: &str, depth: usize) -> RResult<'_, Expr> {
     alt((
-        delimited(ws(char('(')), parse_expr, ws(char(')'))),
+        delimited(
+            ws(char('(')),
+            |i| parse_expr_depth(i, depth + 1),
+            ws(char(')')),
+        ),
         parse_function_call,
     ))(input)
 }
@@ -1189,5 +1221,47 @@ mod tests {
             }
             other => panic!("Expected InvalidActionCombination, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_depth_limit_parentheses() {
+        // Build an expression with nesting deeper than MAX_EXPR_DEPTH
+        let open = "(".repeat(MAX_EXPR_DEPTH + 2);
+        let close = ")".repeat(MAX_EXPR_DEPTH + 2);
+        let deep = format!(r#"{open}host("x"){close} = block"#);
+        let result = parse_rule("deep", &deep);
+        match result {
+            Err(ParseError::InvalidValue { detail, .. }) => {
+                assert!(
+                    detail.contains("nesting"),
+                    "Expected nesting error, got: {detail}"
+                );
+            }
+            other => panic!("Expected depth limit error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_depth_limit_negation() {
+        // Chained negation deeper than MAX_EXPR_DEPTH
+        let nots = "!".repeat(MAX_EXPR_DEPTH + 2);
+        let deep = format!(r#"{nots}host("x") = block"#);
+        let result = parse_rule("deep-not", &deep);
+        match result {
+            Err(ParseError::InvalidValue { detail, .. }) => {
+                assert!(
+                    detail.contains("nesting"),
+                    "Expected nesting error, got: {detail}"
+                );
+            }
+            other => panic!("Expected depth limit error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reasonable_depth_still_works() {
+        // 5 levels of nesting should be fine
+        let rule = parse_rule("ok", r#"((((host("x"))))) = block"#).unwrap();
+        assert!(matches!(rule.action, Action::Block));
     }
 }

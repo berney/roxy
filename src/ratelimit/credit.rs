@@ -42,6 +42,10 @@ pub enum ResetSchedule {
 }
 
 /// A single credit bucket for one key.
+///
+/// All atomic fields are accessed under the DashMap shard write-lock
+/// (via `entry()` in `CreditManager::check()`). `Ordering::Relaxed` is
+/// safe because the `parking_lot::RwLock` provides acquire/release barriers.
 #[derive(Debug)]
 struct CreditBucket {
     used: AtomicU64,
@@ -168,7 +172,7 @@ impl ResetSchedule {
     /// Format epoch seconds as "YYYY-MM-DDTHH:MM:SSZ".
     pub fn format_reset_time(epoch_secs: u64) -> String {
         DateTime::from_timestamp(epoch_secs as i64, 0)
-            .unwrap_or_else(Utc::now)
+            .expect("BUG: epoch timestamp out of representable range")
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string()
     }
@@ -214,7 +218,8 @@ impl CreditManager {
             }
         };
 
-        let now_epoch = Utc::now().timestamp() as u64;
+        let now_epoch = u64::try_from(Utc::now().timestamp())
+            .expect("system clock is before Unix epoch — check NTP");
         let bucket_key = format!("{}:{}", rule_name, key);
 
         let mut entry = self
@@ -282,7 +287,8 @@ impl CreditManager {
 
     /// Remove buckets not accessed in 48 hours.
     pub fn force_cleanup(&self) {
-        let now_epoch = Utc::now().timestamp() as u64;
+        let now_epoch = u64::try_from(Utc::now().timestamp())
+            .expect("system clock is before Unix epoch — check NTP");
         let expiry_secs = 48 * 3600;
         self.buckets.retain(|_, bucket| {
             now_epoch.saturating_sub(bucket.last_access.load(Ordering::Relaxed)) < expiry_secs

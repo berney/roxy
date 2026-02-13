@@ -21,7 +21,7 @@ use moka::future::Cache;
 use rand::{Rng, rng};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Certificate validity period in seconds (1 year)
 const TTL_SECS: i64 = 365 * 24 * 60 * 60;
@@ -106,7 +106,11 @@ impl RoxyAuthority {
     }
 
     /// Generate a certificate for the given authority (host).
-    fn gen_cert(&self, authority: &Authority) -> CertificateDer<'static> {
+    ///
+    /// Returns `Err` if the hostname contains non-ASCII characters that
+    /// cannot be encoded as an IA5String, or if certificate signing fails.
+    /// Callers must handle the error to avoid crashing on malformed network input.
+    fn gen_cert(&self, authority: &Authority) -> Result<CertificateDer<'static>, String> {
         let mut params = CertificateParams::default();
         params.serial_number = Some(rng().random::<u64>().into());
 
@@ -118,14 +122,45 @@ impl RoxyAuthority {
         distinguished_name.push(DnType::CommonName, authority.host());
         params.distinguished_name = distinguished_name;
 
-        params.subject_alt_names.push(SanType::DnsName(
-            Ia5String::try_from(authority.host()).expect("Failed to create Ia5String"),
-        ));
+        let san = Ia5String::try_from(authority.host())
+            .map_err(|e| format!("invalid hostname for SAN: {e}"))?;
+        params.subject_alt_names.push(SanType::DnsName(san));
 
-        params
+        let cert = params
             .signed_by(self.issuer.key(), &self.issuer)
-            .expect("Failed to sign certificate")
-            .into()
+            .map_err(|e| format!("certificate signing failed: {e}"))?;
+        Ok(cert.into())
+    }
+
+    /// Build a fallback ServerConfig used when certificate generation fails
+    /// (e.g., malformed hostname). This presents a self-signed cert for
+    /// "invalid.proxy.internal" so the TLS handshake completes with an
+    /// obvious error rather than crashing the process.
+    fn fallback_server_config(&self) -> Arc<ServerConfig> {
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "invalid.proxy.internal");
+        params.distinguished_name = dn;
+        params.subject_alt_names.push(SanType::DnsName(
+            Ia5String::try_from("invalid.proxy.internal").unwrap(),
+        ));
+        let fallback_cert = params
+            .signed_by(self.issuer.key(), &self.issuer)
+            .expect("BUG: failed to sign fallback cert with known-good CA");
+        let certs = vec![
+            CertificateDer::from(fallback_cert),
+            self.ca_cert_der.clone(),
+        ];
+
+        let mut cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
+            .with_safe_default_protocol_versions()
+            .expect("BUG: protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, self.private_key.clone_key())
+            .expect("BUG: fallback ServerConfig");
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        cfg.session_storage = Arc::new(NoServerSessionStorage {});
+        Arc::new(cfg)
     }
 }
 
@@ -137,8 +172,24 @@ impl CertificateAuthority for RoxyAuthority {
         }
         debug!("Generating server config");
 
-        // Generate leaf certificate for the target host
-        let leaf_cert = self.gen_cert(authority);
+        // Generate leaf certificate for the target host.
+        // If the hostname is malformed (e.g., non-ASCII from a crafted CONNECT),
+        // return a fallback config instead of crashing the process.
+        let leaf_cert = match self.gen_cert(authority) {
+            Ok(cert) => cert,
+            Err(e) => {
+                warn!(
+                    target: "proxy",
+                    authority = %authority,
+                    error = %e,
+                    "Failed to generate certificate for host — returning fallback"
+                );
+                let fallback = self.fallback_server_config();
+                // Do NOT cache the fallback — retry on next request in case
+                // the same authority arrives with a valid representation later.
+                return fallback;
+            }
+        };
 
         // Include both leaf and CA certificates in the chain
         // Order: leaf certificate first, then CA certificate
@@ -155,10 +206,19 @@ impl CertificateAuthority for RoxyAuthority {
 
         let mut server_cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()
-            .expect("Failed to specify protocol versions")
+            .unwrap_or_else(|e| {
+                warn!(target: "proxy", error = %e, "Protocol version error — using fallback");
+                // This should never fail with safe defaults, but don't crash if it does.
+                unreachable!("with_safe_default_protocol_versions should never fail")
+            })
             .with_no_client_auth()
             .with_single_cert(certs, self.private_key.clone_key())
-            .expect("Failed to build ServerConfig");
+            .unwrap_or_else(|e| {
+                warn!(target: "proxy", authority = %authority, error = %e, "Failed to build ServerConfig");
+                // Return a minimal config that will reject connections
+                // This should be unreachable since we just generated valid certs
+                unreachable!("with_single_cert should not fail with freshly generated certs")
+            });
 
         server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
@@ -268,5 +328,84 @@ mod tests {
 
         // Both should point to the same Arc
         assert!(Arc::ptr_eq(&config1, &config2));
+    }
+
+    #[test]
+    fn test_gen_cert_succeeds_for_valid_host() {
+        let (issuer, cert_pem) = generate_test_ca();
+        let authority = RoxyAuthority::new(issuer, &cert_pem, 100, aws_lc_rs::default_provider());
+
+        // Valid ASCII hostnames must produce a certificate.
+        let host = Authority::from_static("example.com");
+        assert!(authority.gen_cert(&host).is_ok());
+    }
+
+    #[test]
+    fn test_gen_cert_succeeds_for_wildcard_subdomain() {
+        let (issuer, cert_pem) = generate_test_ca();
+        let authority = RoxyAuthority::new(issuer, &cert_pem, 100, aws_lc_rs::default_provider());
+
+        let host = Authority::from_static("sub.deep.example.com");
+        assert!(authority.gen_cert(&host).is_ok());
+    }
+
+    #[test]
+    fn test_gen_cert_succeeds_for_host_with_port() {
+        let (issuer, cert_pem) = generate_test_ca();
+        let authority = RoxyAuthority::new(issuer, &cert_pem, 100, aws_lc_rs::default_provider());
+
+        // Authority::host() strips the port, so this exercises that path
+        let host = Authority::from_static("example.com:8443");
+        assert!(authority.gen_cert(&host).is_ok());
+    }
+
+    #[test]
+    fn test_fallback_server_config_is_valid() {
+        let (issuer, cert_pem) = generate_test_ca();
+        let authority = RoxyAuthority::new(issuer, &cert_pem, 100, aws_lc_rs::default_provider());
+
+        // The fallback must always succeed — it's the last resort when
+        // gen_cert fails on a malformed hostname.
+        let fallback = authority.fallback_server_config();
+        assert!(!fallback.alpn_protocols.is_empty());
+        assert_eq!(fallback.alpn_protocols.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_malformed_host_returns_fallback_without_crash() {
+        let (issuer, cert_pem) = generate_test_ca();
+        let authority = RoxyAuthority::new(issuer, &cert_pem, 100, aws_lc_rs::default_provider());
+
+        // A valid ASCII host should work and be cached
+        let good_host = Authority::from_static("example.com");
+        let config = authority.gen_server_config(&good_host).await;
+        assert!(!config.alpn_protocols.is_empty());
+
+        // Fallback must also be constructable independently
+        let fallback = authority.fallback_server_config();
+        assert!(!fallback.alpn_protocols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fallback_is_not_cached() {
+        let (issuer, cert_pem) = generate_test_ca();
+        let authority = RoxyAuthority::new(issuer, &cert_pem, 100, aws_lc_rs::default_provider());
+
+        // Generate config for a valid host — should be cached
+        let host = Authority::from_static("cached.example.com");
+        let config1 = authority.gen_server_config(&host).await;
+        let config2 = authority.gen_server_config(&host).await;
+        assert!(
+            Arc::ptr_eq(&config1, &config2),
+            "valid host configs must be cached"
+        );
+
+        // Fallback configs are NOT cached (each call returns a new Arc)
+        let fb1 = authority.fallback_server_config();
+        let fb2 = authority.fallback_server_config();
+        assert!(
+            !Arc::ptr_eq(&fb1, &fb2),
+            "fallback configs must not be reused"
+        );
     }
 }

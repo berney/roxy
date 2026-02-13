@@ -187,9 +187,12 @@ impl CompiledRule {
     fn extract_indexed_method(expr: &Expr) -> Option<Method> {
         match expr {
             Expr::Method(m) => Some(m.clone()),
-            Expr::And(left, _) => {
-                // Check if left side is a method check
+            Expr::And(left, right) => {
+                // Check both sides of top-level AND for a method check
                 if let Expr::Method(m) = left.as_ref() {
+                    return Some(m.clone());
+                }
+                if let Expr::Method(m) = right.as_ref() {
                     return Some(m.clone());
                 }
                 None
@@ -545,6 +548,21 @@ mod tests {
             None,
         );
         assert_eq!(rule3.indexed_method, None);
+    }
+
+    #[test]
+    fn test_method_indexing_right_side_of_and() {
+        // Method on right side of AND should also be extracted
+        let rule = CompiledRule::new(
+            "test-right".to_string(),
+            Expr::And(
+                Box::new(Expr::Host(make_glob("api.*"))),
+                Box::new(Expr::Method(Method::DELETE)),
+            ),
+            Action::Block,
+            None,
+        );
+        assert_eq!(rule.indexed_method, Some(Method::DELETE));
     }
 
     #[test]

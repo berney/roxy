@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use roxy::config::ProxyConfig;
@@ -82,6 +82,23 @@ fn create_ca(config: &ProxyConfig) -> RoxyAuthority {
                 error!(target: "proxy", path = %tls_config.ca_key.display(), error = %e, "Failed to read CA key");
                 std::process::exit(1);
             });
+
+        // Warn if CA private key is readable by group or others (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(&tls_config.ca_key) {
+                let mode = meta.mode();
+                if mode & 0o077 != 0 {
+                    warn!(
+                        target: "proxy",
+                        path = %tls_config.ca_key.display(),
+                        mode = format!("{:04o}", mode & 0o7777),
+                        "CA private key is readable by group/others — consider chmod 600"
+                    );
+                }
+            }
+        }
         
         let cert_pem = std::fs::read_to_string(&tls_config.ca_cert)
             .unwrap_or_else(|e| {

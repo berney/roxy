@@ -156,14 +156,16 @@ impl SlidingWindow {
         }
     }
 
-    /// Check if this window has expired (not accessed in 2 windows).
-    #[allow(dead_code)]
-    pub fn is_expired(&self, now_ms: u64) -> bool {
-        let last_access = self.last_access.load(Ordering::Relaxed);
-        now_ms.saturating_sub(last_access) >= self.window_ms * 2
-    }
-
     /// Check if request is allowed and increment counter if so.
+    ///
+    /// # Safety invariant
+    ///
+    /// This method MUST be called while the caller holds the DashMap shard
+    /// write-lock (via `entry()` or `get_mut()`). The shard lock serializes
+    /// concurrent access to the same key, making the non-atomic
+    /// load→compare→fetch_add sequence safe. `Ordering::Relaxed` is sufficient
+    /// because the `parking_lot::RwLock` underlying DashMap provides
+    /// acquire/release barriers on lock/unlock.
     fn check_and_increment(&self, now_ms: u64) -> RateLimitResult {
         // Update last access time
         self.last_access.store(now_ms, Ordering::Relaxed);
@@ -193,6 +195,13 @@ impl SlidingWindow {
     }
 
     /// Rotate window if needed.
+    ///
+    /// # Safety invariant
+    ///
+    /// Must be called under DashMap shard write-lock (see `check_and_increment`).
+    /// The three stores to `previous_count`, `current_count`, and `window_start`
+    /// are effectively atomic as a group because the shard lock prevents
+    /// concurrent access to the same key.
     fn maybe_rotate(&self, now_ms: u64) {
         let window_start = self.window_start.load(Ordering::Relaxed);
 

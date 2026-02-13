@@ -9,6 +9,10 @@ use std::str::FromStr;
 
 use crate::error::ConfigError;
 
+/// Maximum allowed value for max_delay_ms in throttle/credit configs.
+/// Caps how long a request can be held sleeping, limiting connection exhaustion.
+const MAX_THROTTLE_DELAY_MS: u64 = 60_000;
+
 /// Root configuration structure.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfig {
@@ -202,10 +206,13 @@ impl ProxyConfig {
 
     /// Validate configuration consistency.
     fn validate(&self) -> Result<(), ConfigError> {
-        // Validate listen address format
+        // Validate listen address is a valid SocketAddr
         if self.listen.is_empty() {
             return Err(ConfigError::MissingField("listen".to_string()));
         }
+        self.listen.parse::<std::net::SocketAddr>().map_err(|e| {
+            ConfigError::Invalid(format!("Invalid listen address '{}': {}", self.listen, e))
+        })?;
 
         // Validate rule names are unique
         let mut seen_names = std::collections::HashSet::new();
@@ -223,7 +230,7 @@ impl ProxyConfig {
             }
         }
 
-        // Validate header mangle rule references exist
+        // Validate header mangle rule references exist and header names/values are valid HTTP
         for header_config in &self.headers {
             for rule_ref in &header_config.rules {
                 if !seen_names.contains(rule_ref) {
@@ -233,9 +240,26 @@ impl ProxyConfig {
                     )));
                 }
             }
+            for add in &header_config.add {
+                add.name.parse::<http::HeaderName>().map_err(|e| {
+                    ConfigError::Invalid(format!("Invalid header name '{}': {}", add.name, e))
+                })?;
+                add.value.parse::<http::HeaderValue>().map_err(|e| {
+                    ConfigError::Invalid(format!("Invalid header value for '{}': {}", add.name, e))
+                })?;
+            }
+            for remove_name in &header_config.remove {
+                remove_name.parse::<http::HeaderName>().map_err(|e| {
+                    ConfigError::Invalid(format!(
+                        "Invalid header name to remove '{}': {}",
+                        remove_name, e
+                    ))
+                })?;
+            }
         }
 
-        // Validate throttle config references exist
+        // Validate throttle config references exist, uniqueness, and max_delay_ms cap
+        let mut seen_throttle_rules = std::collections::HashSet::new();
         for throttle in &self.throttle {
             if !seen_names.contains(&throttle.rule) {
                 return Err(ConfigError::Invalid(format!(
@@ -243,14 +267,39 @@ impl ProxyConfig {
                     throttle.rule
                 )));
             }
+            if !seen_throttle_rules.insert(&throttle.rule) {
+                return Err(ConfigError::Invalid(format!(
+                    "Duplicate throttle config for rule: {}",
+                    throttle.rule
+                )));
+            }
+            if throttle.max_delay_ms > MAX_THROTTLE_DELAY_MS {
+                return Err(ConfigError::Invalid(format!(
+                    "Throttle '{}': max_delay_ms ({}) exceeds maximum allowed value ({}ms) you can rebuilt with MAX_THROTTLE_DELAY_MS set higher if you need longer delays",
+                    throttle.rule, throttle.max_delay_ms, MAX_THROTTLE_DELAY_MS
+                )));
+            }
         }
 
-        // Validate credit config references and reset_schedule format
+        // Validate credit config references, uniqueness, reset_schedule format, and max_delay_ms cap
+        let mut seen_credit_rules = std::collections::HashSet::new();
         for credit in &self.credits {
             if !seen_names.contains(&credit.rule) {
                 return Err(ConfigError::Invalid(format!(
                     "Credit config references unknown rule: {}",
                     credit.rule
+                )));
+            }
+            if !seen_credit_rules.insert(&credit.rule) {
+                return Err(ConfigError::Invalid(format!(
+                    "Duplicate credit config for rule: {}",
+                    credit.rule
+                )));
+            }
+            if credit.max_delay_ms > MAX_THROTTLE_DELAY_MS {
+                return Err(ConfigError::Invalid(format!(
+                    "Credit '{}': max_delay_ms ({}) exceeds maximum allowed value ({}ms) you can rebuilt with MAX_THROTTLE_DELAY_MS set higher if you need longer delays",
+                    credit.rule, credit.max_delay_ms, MAX_THROTTLE_DELAY_MS
                 )));
             }
             // Validate reset_schedule by attempting to parse it
@@ -470,5 +519,125 @@ credits:
 "#;
         let config = ProxyConfig::from_str(yaml).unwrap();
         assert_eq!(config.credits[0].reset_schedule, "monthly@01-00:00");
+    }
+
+    #[test]
+    fn test_invalid_listen_address_rejected() {
+        let yaml = r#"
+listen: "not-a-socket-addr"
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid listen address")
+        );
+    }
+
+    #[test]
+    fn test_duplicate_throttle_rejected() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "api-rate"
+    rule: 'host("api.*") = rate_limit(100/s, header(X-Key))'
+throttle:
+  - rule: "api-rate"
+    soft_limit: 80
+  - rule: "api-rate"
+    soft_limit: 90
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate throttle")
+        );
+    }
+
+    #[test]
+    fn test_duplicate_credit_rejected() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "api-credit"
+    rule: 'host("api.*") = credit(1000/d, header(X-Key))'
+credits:
+  - rule: "api-credit"
+    reset_schedule: "daily@00:00"
+    message: "out"
+  - rule: "api-credit"
+    reset_schedule: "daily@12:00"
+    message: "out again"
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Duplicate credit"));
+    }
+
+    #[test]
+    fn test_invalid_header_name_rejected() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "my-rule"
+    rule: 'host("a.com") = mangle'
+headers:
+  - rules: ["my-rule"]
+    add:
+      - name: "Invalid Header!"
+        value: "test"
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid header name")
+        );
+    }
+
+    #[test]
+    fn test_invalid_remove_header_name_rejected() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "my-rule"
+    rule: 'host("a.com") = mangle'
+headers:
+  - rules: ["my-rule"]
+    remove:
+      - "Invalid Header!"
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid header name to remove")
+        );
+    }
+
+    #[test]
+    fn test_throttle_max_delay_capped() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "api-rate"
+    rule: 'host("api.*") = rate_limit(100/s, header(X-Key))'
+throttle:
+  - rule: "api-rate"
+    soft_limit: 80
+    max_delay_ms: 999999
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
     }
 }
