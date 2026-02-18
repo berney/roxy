@@ -108,4 +108,22 @@ mod tests {
         assert_eq!(s.as_str(), "hello:world");
         assert_eq!(s.as_str().len(), 11);
     }
+
+    #[test]
+    fn test_stack_string_push_char_overflow() {
+        let mut s = StackString::<3>::new();
+        assert!(s.push('a').is_ok());
+        assert!(s.push('b').is_ok());
+        assert!(s.push('c').is_ok());
+        // Buffer is full, next push should fail
+        assert!(s.push('d').is_err());
+        assert_eq!(s.as_str(), "abc");
+    }
+
+    #[test]
+    fn test_stack_string_new_empty() {
+        let s = StackString::<64>::new();
+        assert_eq!(s.as_str(), "");
+        assert_eq!(s.as_str().len(), 0);
+    }
 }

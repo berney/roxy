@@ -57,7 +57,9 @@ pub fn extract_ip_key(rule_name: &str, ctx: &EvalContext) -> IpKey {
         };
 
     if ok {
-        IpKey { inner: IpKeyInner::Stack(key) }
+        IpKey {
+            inner: IpKeyInner::Stack(key),
+        }
     } else {
         // Fallback: very long rule name — allocate on heap
         let mut s = String::with_capacity(16 + rule_name.len() + 46);
@@ -65,10 +67,14 @@ pub fn extract_ip_key(rule_name: &str, ctx: &EvalContext) -> IpKey {
         s.push_str(rule_name);
         s.push(':');
         match ctx.client_ip {
-            Some(ip) => { let _ = write!(s, "{}", ip); }
+            Some(ip) => {
+                let _ = write!(s, "{}", ip);
+            }
             None => s.push_str(MISSING_PLACEHOLDER),
         }
-        IpKey { inner: IpKeyInner::Heap(s) }
+        IpKey {
+            inner: IpKeyInner::Heap(s),
+        }
     }
 }
 
@@ -245,5 +251,36 @@ mod tests {
 
         let key = extract_ip_key("my-rule", &ctx);
         assert_eq!(key.as_str(), "__ip_baseline__:my-rule:10.0.0.1");
+    }
+
+    #[test]
+    fn test_extract_ip_key_no_ip() {
+        let headers = HeaderMap::new();
+        let ctx = make_ctx("example.com", "/", &headers, None);
+
+        let key = extract_ip_key("my-rule", &ctx);
+        assert_eq!(key.as_str(), "__ip_baseline__:my-rule:__no_value__");
+    }
+
+    #[test]
+    fn test_extract_ip_key_heap_fallback() {
+        let headers = HeaderMap::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let ctx = make_ctx("example.com", "/", &headers, Some(ip));
+
+        // Use a rule name long enough to exceed the 128-byte stack buffer
+        let long_name = "a".repeat(120);
+        let key = extract_ip_key(&long_name, &ctx);
+        let expected = format!("__ip_baseline__:{}:10.0.0.1", long_name);
+        assert_eq!(key.as_str(), expected);
+    }
+
+    #[test]
+    fn test_extract_client_ip_missing() {
+        let headers = HeaderMap::new();
+        let ctx = make_ctx("example.com", "/", &headers, None);
+
+        let key = extract_key(&KeyExpr::Single(KeyExtractor::ClientIp), &ctx);
+        assert_eq!(key, "__no_value__");
     }
 }

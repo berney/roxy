@@ -319,7 +319,7 @@ impl FromStr for ProxyConfig {
     type Err = ConfigError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let config: ProxyConfig = serde_yaml::from_str(s)?;
+        let config: ProxyConfig = serde_yml::from_str(s)?;
         config.validate()?;
         Ok(config)
     }
@@ -639,5 +639,96 @@ throttle:
         let result = ProxyConfig::from_str(yaml);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+    }
+
+    // === Coverage: PoolConfig::default() ===
+
+    #[test]
+    fn test_pool_config_default() {
+        let pool = PoolConfig::default();
+        assert_eq!(pool.max_idle_per_host, 10);
+        assert_eq!(pool.idle_timeout_secs, 30);
+    }
+
+    // === Coverage: empty listen address ===
+
+    #[test]
+    fn test_empty_listen_rejected() {
+        let yaml = r#"
+listen: ""
+rules: []
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("listen"));
+    }
+
+    // === Coverage: empty rule name ===
+
+    #[test]
+    fn test_empty_rule_name_rejected() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: ""
+    rule: 'host("*") = block'
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    // === Coverage: from_file with nonexistent path ===
+
+    #[test]
+    fn test_from_file_nonexistent() {
+        let result = ProxyConfig::from_file(std::path::Path::new("/nonexistent/config.yaml"));
+        assert!(result.is_err());
+    }
+
+    // === Coverage: invalid header value in mangle add ===
+
+    #[test]
+    fn test_invalid_header_value_in_mangle_add() {
+        let yaml = "listen: \"0.0.0.0:8080\"\nrules:\n  - name: \"my-rule\"\n    rule: 'host(\"*\") = mangle'\nheaders:\n  - rules: [\"my-rule\"]\n    add:\n      - name: \"X-Bad\"\n        value: \"invalid\\x00value\"\n";
+        let result = ProxyConfig::from_str(yaml);
+        // serde_yml may reject the null byte during parsing, or validation will catch it
+        assert!(result.is_err());
+    }
+
+    // === Coverage: credit max_delay_ms exceeded ===
+
+    #[test]
+    fn test_credit_max_delay_ms_exceeded() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "credit-rule"
+    rule: 'host("*") = credit(1000/d, ip)'
+credits:
+  - rule: "credit-rule"
+    reset_schedule: "daily@00:00"
+    max_delay_ms: 999999
+"#;
+        let result = ProxyConfig::from_str(yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+    }
+
+    // === Coverage: default_credit_message ===
+
+    #[test]
+    fn test_default_credit_message_value() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "credit-rule"
+    rule: 'host("*") = credit(1000/d, ip)'
+credits:
+  - rule: "credit-rule"
+    reset_schedule: "daily@00:00"
+"#;
+        let config = ProxyConfig::from_str(yaml).unwrap();
+        assert!(config.credits[0].message.contains("reset_time"));
     }
 }

@@ -659,4 +659,111 @@ mod tests {
         let b = Expr::Host(make_glob("web.*"));
         assert_ne!(a.condition_signature(), b.condition_signature());
     }
+
+    // === Coverage: KeyExpr::has_header_extractor ===
+
+    #[test]
+    fn test_key_expr_single_header_has_header() {
+        let expr = KeyExpr::Single(KeyExtractor::Header(
+            HeaderName::from_static("x-key"),
+            "x-key".to_string(),
+        ));
+        assert!(expr.has_header_extractor());
+    }
+
+    #[test]
+    fn test_key_expr_single_host_no_header() {
+        let expr = KeyExpr::Single(KeyExtractor::Host);
+        assert!(!expr.has_header_extractor());
+    }
+
+    #[test]
+    fn test_key_expr_single_ip_no_header() {
+        let expr = KeyExpr::Single(KeyExtractor::ClientIp);
+        assert!(!expr.has_header_extractor());
+    }
+
+    #[test]
+    fn test_key_expr_composite_with_header() {
+        let expr = KeyExpr::Composite(vec![
+            KeyExtractor::Host,
+            KeyExtractor::Header(HeaderName::from_static("x-key"), "x-key".to_string()),
+            KeyExtractor::Path,
+        ]);
+        assert!(expr.has_header_extractor());
+    }
+
+    #[test]
+    fn test_key_expr_composite_without_header() {
+        let expr = KeyExpr::Composite(vec![
+            KeyExtractor::Host,
+            KeyExtractor::Path,
+            KeyExtractor::ClientIp,
+        ]);
+        assert!(!expr.has_header_extractor());
+    }
+
+    // === Coverage: condition_signature Header with Glob ===
+
+    #[test]
+    fn test_condition_signature_header_glob() {
+        let glob = globset::Glob::new("val*").unwrap().compile_matcher();
+        let expr = Expr::Header {
+            name: "x-custom".to_string(),
+            header_name: HeaderName::from_static("x-custom"),
+            value: Some(HeaderMatch::Glob(glob)),
+        };
+        let sig = expr.condition_signature();
+        assert_eq!(sig, r#"header("x-custom~val*")"#);
+    }
+
+    // === Coverage: evaluate Header with Glob ===
+
+    #[test]
+    fn test_evaluate_header_glob_match() {
+        let glob = globset::Glob::new("bearer*").unwrap().compile_matcher();
+        let expr = Expr::Header {
+            name: "authorization".to_string(),
+            header_name: HeaderName::from_static("authorization"),
+            value: Some(HeaderMatch::Glob(glob)),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("bearer-token-123"),
+        );
+        let ctx = EvalContext {
+            host: "example.com",
+            path: "/",
+            method: &Method::GET,
+            headers: &headers,
+            client_ip: None,
+        };
+        assert!(expr.evaluate(&ctx));
+    }
+
+    #[test]
+    fn test_evaluate_header_glob_no_match() {
+        let glob = globset::Glob::new("bearer*").unwrap().compile_matcher();
+        let expr = Expr::Header {
+            name: "authorization".to_string(),
+            header_name: HeaderName::from_static("authorization"),
+            value: Some(HeaderMatch::Glob(glob)),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("basic-something"),
+        );
+        let ctx = EvalContext {
+            host: "example.com",
+            path: "/",
+            method: &Method::GET,
+            headers: &headers,
+            client_ip: None,
+        };
+        assert!(!expr.evaluate(&ctx));
+    }
 }

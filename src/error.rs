@@ -13,7 +13,7 @@ pub enum ConfigError {
     ReadFile(#[source] std::io::Error),
 
     #[error("Failed to parse YAML: {0}")]
-    ParseYaml(#[from] serde_yaml::Error),
+    ParseYaml(#[from] serde_yml::Error),
 
     #[error("Invalid configuration: {0}")]
     Invalid(String),

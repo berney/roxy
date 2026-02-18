@@ -150,12 +150,32 @@ fn create_ca(config: &ProxyConfig) -> RoxyAuthority {
 }
 
 /// Graceful shutdown signal handler.
-/// Returns a Notify that is triggered when Ctrl+C is received.
+/// Waits for Ctrl+C or SIGTERM (Unix), then notifies all background tasks.
 async fn shutdown_signal(shutdown: Arc<tokio::sync::Notify>) {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C signal handler");
-    info!(target: "proxy", "Shutdown signal received");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(e) = result {
+                    error!(target: "proxy", error = %e, "Failed to listen for CTRL+C");
+                }
+                info!(target: "proxy", signal = "SIGINT", "Shutdown signal received");
+            }
+            _ = sigterm.recv() => {
+                info!(target: "proxy", signal = "SIGTERM", "Shutdown signal received");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!(target: "proxy", error = %e, "Failed to listen for CTRL+C");
+        }
+        info!(target: "proxy", "Shutdown signal received");
+    }
     shutdown.notify_waiters();
 }
 

@@ -1316,4 +1316,137 @@ mod tests {
         let rule = parse_rule("ok", r#"((((host("x"))))) = block"#).unwrap();
         assert!(matches!(rule.action, Action::Block));
     }
+
+    // === Coverage: parse_path InvalidGlob ===
+
+    #[test]
+    fn test_parse_path_invalid_glob() {
+        let result = parse_rule("bad-path", r#"path("[invalid") = block"#);
+        match result {
+            Err(ParseError::InvalidGlob {
+                rule_name, pattern, ..
+            }) => {
+                assert_eq!(rule_name, "bad-path");
+                assert_eq!(pattern, "[invalid");
+            }
+            other => panic!("Expected InvalidGlob for path, got {:?}", other),
+        }
+    }
+
+    // === Coverage: parse_header branches ===
+
+    #[test]
+    fn test_parse_header_glob_match() {
+        let rule = parse_rule("hdr-glob", r#"header("X-Custom~val*") = pass"#).unwrap();
+        if let Expr::Header { name, value, .. } = &rule.condition {
+            assert_eq!(name, "x-custom");
+            assert!(matches!(value, Some(HeaderMatch::Glob(_))));
+        } else {
+            panic!("Expected Header expression with glob");
+        }
+    }
+
+    #[test]
+    fn test_parse_header_glob_invalid() {
+        let result = parse_rule("bad-hdr-glob", r#"header("X-Custom~[broken") = block"#);
+        match result {
+            Err(ParseError::InvalidGlob {
+                rule_name, pattern, ..
+            }) => {
+                assert_eq!(rule_name, "bad-hdr-glob");
+                assert_eq!(pattern, "[broken");
+            }
+            other => panic!("Expected InvalidGlob for header glob, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_header_existence_only() {
+        let rule = parse_rule("hdr-exists", r#"header("X-Exists") = pass"#).unwrap();
+        if let Expr::Header { name, value, .. } = &rule.condition {
+            assert_eq!(name, "x-exists");
+            assert!(value.is_none(), "Expected existence-only check (no value)");
+        } else {
+            panic!("Expected Header expression");
+        }
+    }
+
+    #[test]
+    fn test_parse_header_invalid_name() {
+        let result = parse_rule("bad-hdr", "header(\"\x00bad:val\") = block");
+        assert!(result.is_err(), "Expected error for invalid header name");
+    }
+
+    // === Coverage: Nom fallback with long input ===
+
+    #[test]
+    fn test_parse_long_garbled_input_truncated() {
+        // Input > 30 chars of garbage to trigger nom fallback with truncation
+        let garbled = "this-is-definitely-not-valid-rule-syntax-at-all = block";
+        let result = parse_rule("garbled", garbled);
+        match result {
+            Err(ParseError::UnexpectedToken { rule_name, .. }) => {
+                assert_eq!(rule_name, "garbled");
+            }
+            other => panic!(
+                "Expected UnexpectedToken for garbled input, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // === Coverage: composite action error paths ===
+
+    #[test]
+    fn test_parse_duplicate_credit_combo_error() {
+        let result = parse_rule(
+            "dup-credit",
+            r#"host("*") = credit(100/d, ip) + credit(200/d, ip)"#,
+        );
+        match result {
+            Err(ParseError::InvalidActionCombination { rule_name, detail }) => {
+                assert_eq!(rule_name, "dup-credit");
+                assert!(
+                    detail.contains("duplicate"),
+                    "Detail should mention duplicate: {}",
+                    detail
+                );
+            }
+            other => panic!("Expected InvalidActionCombination, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_pass_in_composite_error() {
+        let result = parse_rule("bad-pass", r#"host("*") = pass + rate_limit(10/s, ip)"#);
+        match result {
+            Err(ParseError::InvalidActionCombination { rule_name, detail }) => {
+                assert_eq!(rule_name, "bad-pass");
+                assert!(
+                    detail.contains("pass"),
+                    "Detail should mention 'pass': {}",
+                    detail
+                );
+            }
+            other => panic!("Expected InvalidActionCombination, got {:?}", other),
+        }
+    }
+
+    // === Coverage: credit(0/d, ip) ===
+
+    #[test]
+    fn test_parse_zero_credit_budget_rejected() {
+        let result = parse_rule("zero-cred", r#"host("*") = credit(0/d, ip)"#);
+        match result {
+            Err(ParseError::InvalidValue { rule_name, detail }) => {
+                assert_eq!(rule_name, "zero-cred");
+                assert!(
+                    detail.contains("credit"),
+                    "Detail should mention credit: {}",
+                    detail
+                );
+            }
+            other => panic!("Expected InvalidValue, got {:?}", other),
+        }
+    }
 }

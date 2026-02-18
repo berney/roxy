@@ -51,11 +51,17 @@ pub enum RateLimitResult {
     Allowed {
         /// Remaining requests in current window
         remaining: u64,
+        /// Maximum requests per window
+        limit: u64,
+        /// Seconds until the current window resets
+        reset_after_secs: u64,
     },
     /// Request is rate limited
     Limited {
         /// Seconds until the limit resets
         retry_after_secs: u64,
+        /// Maximum requests per window
+        limit: u64,
     },
 }
 
@@ -89,10 +95,9 @@ impl RateLimiter {
                 window.check_and_increment(now_ms)
             } else {
                 // Slow path: first time seeing this key — allocate String for entry()
-                let mut entry = self
-                    .windows
-                    .entry(key.to_string())
-                    .or_insert_with(|| SlidingWindow::new(max_requests, window_secs * 1000, now_ms));
+                let mut entry = self.windows.entry(key.to_string()).or_insert_with(|| {
+                    SlidingWindow::new(max_requests, window_secs * 1000, now_ms)
+                });
                 entry.value_mut().check_and_increment(now_ms)
             }
         }; // shard lock dropped here
@@ -190,15 +195,22 @@ impl SlidingWindow {
 
         let weighted_count = current as f64 + (previous as f64 * (1.0 - window_progress));
 
+        let reset_after_ms = self.window_ms.saturating_sub(elapsed_in_window);
+        let reset_after_secs = (reset_after_ms / 1000).max(1);
+
         if weighted_count < self.max_requests as f64 {
             self.current_count.fetch_add(1, Ordering::Relaxed);
             let remaining = (self.max_requests as f64 - weighted_count - 1.0).max(0.0) as u64;
-            RateLimitResult::Allowed { remaining }
+            RateLimitResult::Allowed {
+                remaining,
+                limit: self.max_requests,
+                reset_after_secs,
+            }
         } else {
-            // Calculate retry-after
-            let retry_after_ms = self.window_ms - elapsed_in_window;
-            let retry_after_secs = (retry_after_ms / 1000).max(1);
-            RateLimitResult::Limited { retry_after_secs }
+            RateLimitResult::Limited {
+                retry_after_secs: reset_after_secs,
+                limit: self.max_requests,
+            }
         }
     }
 
@@ -254,7 +266,7 @@ mod tests {
         for i in 0..5 {
             let result = limiter.check("test-key", 10, 1);
             assert!(
-                matches!(result, RateLimitResult::Allowed { remaining } if remaining == 10 - i - 1),
+                matches!(result, RateLimitResult::Allowed { remaining, .. } if remaining == 10 - i - 1),
                 "Expected allowed with {} remaining, got {:?}",
                 10 - i - 1,
                 result
@@ -288,5 +300,125 @@ mod tests {
         // key2 should still be allowed
         let result = limiter.check("key2", 10, 1);
         assert!(matches!(result, RateLimitResult::Allowed { .. }));
+    }
+
+    #[test]
+    fn test_result_contains_limit_and_reset() {
+        let limiter = RateLimiter::new(Duration::from_secs(60));
+        let result = limiter.check("test-key", 50, 10);
+        match result {
+            RateLimitResult::Allowed {
+                remaining,
+                limit,
+                reset_after_secs,
+            } => {
+                assert_eq!(remaining, 49);
+                assert_eq!(limit, 50);
+                assert!(reset_after_secs <= 10);
+            }
+            other => panic!("expected Allowed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_limited_contains_limit() {
+        let limiter = RateLimiter::new(Duration::from_secs(60));
+        for _ in 0..10 {
+            limiter.check("test-key", 10, 1);
+        }
+        let result = limiter.check("test-key", 10, 1);
+        match result {
+            RateLimitResult::Limited {
+                retry_after_secs,
+                limit,
+            } => {
+                assert_eq!(limit, 10);
+                assert!(retry_after_secs >= 1);
+            }
+            other => panic!("expected Limited, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_force_cleanup_removes_expired() {
+        let limiter = RateLimiter::new(Duration::from_millis(1));
+        limiter.check("key1", 100, 1);
+        limiter.check("key2", 100, 1);
+        assert_eq!(limiter.key_count(), 2);
+
+        // Wait for entries to expire (window_ms=1000ms because window_secs=1,
+        // so 2 windows = 2s; we need entries to be "not accessed in 2 windows")
+        std::thread::sleep(Duration::from_secs(3));
+        limiter.force_cleanup();
+        assert_eq!(limiter.key_count(), 0);
+    }
+
+    #[test]
+    fn test_force_cleanup_keeps_recent() {
+        let limiter = RateLimiter::new(Duration::from_secs(60));
+        limiter.check("key1", 100, 60);
+        limiter.force_cleanup();
+        assert_eq!(limiter.key_count(), 1);
+    }
+
+    #[test]
+    fn test_elapsed_ms() {
+        let limiter = RateLimiter::new(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(limiter.elapsed_ms() >= 10);
+    }
+
+    // === Coverage: multi-window rotation ===
+
+    #[test]
+    fn test_sliding_window_multi_rotation() {
+        // Use a 100ms window so we can sleep past 2+ windows easily
+        let limiter = RateLimiter::new(Duration::from_millis(1));
+
+        // Make requests within the first window
+        let r1 = limiter.check("key1", 10, 1);
+        assert!(matches!(r1, RateLimitResult::Allowed { .. }));
+        let r2 = limiter.check("key1", 10, 1);
+        assert!(matches!(r2, RateLimitResult::Allowed { .. }));
+
+        // Sleep past 2+ windows to trigger multi-window rotation
+        std::thread::sleep(Duration::from_secs(3));
+
+        // After 2+ windows, both previous and current should be reset
+        let r3 = limiter.check("key1", 10, 1);
+        assert!(
+            matches!(r3, RateLimitResult::Allowed { remaining: 9, .. }),
+            "After multi-window gap, should have full budget. Got {:?}",
+            r3
+        );
+    }
+
+    // === Coverage: RateLimiter::default() ===
+
+    #[test]
+    fn test_rate_limiter_default() {
+        let limiter = RateLimiter::default();
+        // Default should use 60s window
+        let result = limiter.check("key", 100, 60);
+        assert!(matches!(result, RateLimitResult::Allowed { .. }));
+    }
+
+    // === Coverage: single-window rotation ===
+
+    #[test]
+    fn test_sliding_window_single_rotation() {
+        let limiter = RateLimiter::new(Duration::from_millis(1));
+
+        // Make requests
+        for _ in 0..5 {
+            limiter.check("rot-key", 100, 1);
+        }
+
+        // Wait for exactly 1 window (1s window_secs = 1000ms)
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // After single-window rotation, previous should have old count
+        let r = limiter.check("rot-key", 100, 1);
+        assert!(matches!(r, RateLimitResult::Allowed { .. }));
     }
 }

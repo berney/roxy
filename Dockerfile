@@ -8,22 +8,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     clang \
+    make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
 # Cache dependencies by building them first (this saves us a complete rebuild if no deps change)
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src benches && \
+RUN mkdir -p src benches/common && \
     echo "fn main() {}" > src/main.rs && \
     echo "// dummy lib" > src/lib.rs && \
     echo "// dummy bench file" > benches/rules.rs && \
+    echo "// dummy bench file" > benches/request.rs && \
+    echo "// dummy common" > benches/common/mod.rs && \
     cargo build --release && \
     rm -rf src
 
 # Build the actual application
 COPY src ./src
-RUN touch src/main.rs src/lib.rs benches/rules.rs && \
+RUN touch src/main.rs src/lib.rs && \
     cargo build --release --locked && \
     strip target/release/roxy
 

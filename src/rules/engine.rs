@@ -979,4 +979,150 @@ mod tests {
         assert_eq!(r.rule_name, "block-all");
         assert!(matches!(r.action, Action::Block));
     }
+
+    // === Coverage: LoggedHeaders Debug + Default ===
+
+    #[test]
+    fn test_logged_headers_debug_format() {
+        let mut logged = LoggedHeaders::new();
+        logged.push("x-auth", "token123");
+        logged.push("x-trace", "abc");
+        let debug = format!("{:?}", logged);
+        assert!(
+            debug.contains("x-auth"),
+            "Debug should contain header name: {}",
+            debug
+        );
+        assert!(
+            debug.contains("token123"),
+            "Debug should contain header value: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_logged_headers_default_impl() {
+        let logged = LoggedHeaders::default();
+        assert_eq!(logged.iter().count(), 0);
+    }
+
+    // === Coverage: MangleMatches overflow + push_name ===
+
+    #[test]
+    fn test_mangle_matches_overflow_to_heap() {
+        let mut matches = MangleMatches::new();
+        let names_storage: Vec<String> = (0..MAX_MANGLE_MATCHES)
+            .map(|i| format!("rule-{}", i))
+            .collect();
+        // Fill the stack slots (MAX_MANGLE_MATCHES = 4)
+        for name in &names_storage {
+            matches.push_name(name);
+        }
+        // Push beyond stack capacity → should spill to heap
+        matches.push_name("overflow-rule-1");
+        matches.push_name("overflow-rule-2");
+
+        let names: Vec<&str> = matches.iter().collect();
+        assert_eq!(names.len(), MAX_MANGLE_MATCHES + 2);
+        assert_eq!(names[MAX_MANGLE_MATCHES], "overflow-rule-1");
+        assert_eq!(names[MAX_MANGLE_MATCHES + 1], "overflow-rule-2");
+    }
+
+    // === Coverage: RuleIndex::default() ===
+
+    #[test]
+    fn test_rule_index_default() {
+        let index = RuleIndex::default();
+        assert_eq!(index.rule_count(), 0);
+    }
+
+    // === Coverage: warn_unreachable ===
+
+    #[test]
+    fn test_warn_unreachable_after_ternary() {
+        let rules = vec![
+            RuleConfig {
+                name: "ternary".to_string(),
+                rule: r#"header("X-Auth") = pass : block"#.to_string(),
+            },
+            RuleConfig {
+                name: "unreachable".to_string(),
+                rule: r#"host("*") = block"#.to_string(),
+            },
+        ];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        // Should log a warning for unreachable rule — we just exercise the code path
+        index.warn_unreachable();
+    }
+
+    #[test]
+    fn test_warn_unreachable_method_bucket() {
+        // Ternary in a method-specific bucket
+        let rules = vec![
+            RuleConfig {
+                name: "get-ternary".to_string(),
+                rule: r#"method(GET) && header("X-Auth") = pass : block"#.to_string(),
+            },
+            RuleConfig {
+                name: "get-after".to_string(),
+                rule: r#"method(GET) && host("*") = pass"#.to_string(),
+            },
+        ];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        index.warn_unreachable();
+    }
+
+    // === Coverage: evaluate with logged headers resolving values ===
+
+    #[test]
+    fn test_evaluate_logged_headers_with_values() {
+        let mut index = RuleIndex::new();
+        // Rule with existence-only header check → logged headers should capture values
+        let rule = parse_rule("log-hdr", r#"header("X-Request-Id") = pass"#).unwrap();
+        index.add_rule(rule);
+        index.rebuild_merged_index();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_static("req-abc-123"),
+        );
+        let ctx = make_ctx("example.com", "/", &Method::GET, &headers);
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "log-hdr");
+        assert_eq!(r.logged_headers.get("x-request-id"), Some("req-abc-123"));
+    }
+
+    // === Coverage: evaluate_mangle_rules with method-specific rules ===
+
+    #[test]
+    fn test_evaluate_mangle_rules_method_specific() {
+        let mut index = RuleIndex::new();
+        let rule = parse_rule("mangle-get", r#"method(GET) && host("*.com") = mangle"#).unwrap();
+        index.add_rule(rule);
+        let rule = parse_rule("mangle-any", r#"host("*.org") = mangle"#).unwrap();
+        index.add_rule(rule);
+        index.rebuild_merged_index();
+
+        let headers = HeaderMap::new();
+        let ctx = make_ctx("test.com", "/", &Method::GET, &headers);
+        let matched = index.evaluate_mangle_rules(&ctx);
+        let names: Vec<&str> = matched.iter().collect();
+        assert_eq!(names, vec!["mangle-get"]);
+    }
+
+    // === Coverage: credit_budgets with RateLimitCredit ===
+
+    #[test]
+    fn test_credit_budgets_from_composite() {
+        let rules = vec![RuleConfig {
+            name: "composite".to_string(),
+            rule: r#"host("*") = rate_limit(100/s, ip) + credit(5000/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let budgets = index.credit_budgets();
+        assert_eq!(budgets.len(), 1);
+        assert_eq!(budgets[0].0, "composite");
+        assert_eq!(budgets[0].1, 5000);
+    }
 }

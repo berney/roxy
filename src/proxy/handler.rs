@@ -31,6 +31,17 @@ struct ParsedHeaderRemove {
     name: http::HeaderName,
 }
 
+/// Rate limit metadata to inject as X-RateLimit-* response headers.
+#[derive(Clone, Debug, Default)]
+struct RateLimitHeaders {
+    /// Maximum requests allowed in the window
+    limit: u64,
+    /// Remaining requests in the current window
+    remaining: u64,
+    /// Seconds until the window resets
+    reset_after_secs: u64,
+}
+
 /// Pre-parsed header mangle config (no per-request `.parse()` calls).
 #[derive(Clone, Debug)]
 struct ParsedMangleConfig {
@@ -55,6 +66,10 @@ pub struct RoxyHandler {
 
     /// Throttle configs indexed by rule name
     throttle_configs: Arc<HashMap<String, ThrottleConfig>>,
+
+    /// Per-request rate limit info to inject into the response.
+    /// Set during handle_request, consumed by handle_response.
+    pending_ratelimit_headers: Option<RateLimitHeaders>,
 }
 
 impl RoxyHandler {
@@ -108,6 +123,7 @@ impl RoxyHandler {
             credit_manager,
             header_configs: Arc::new(configs_by_rule),
             throttle_configs: Arc::new(throttle_by_rule),
+            pending_ratelimit_headers: None,
         }
     }
 
@@ -165,16 +181,21 @@ impl RoxyHandler {
             return None; // No user-controlled components, no need for baseline
         }
         let ip_key = extract_ip_key(rule_name, ctx);
-        Some(self.rate_limiter.check(ip_key.as_str(), requests, window_secs))
+        Some(
+            self.rate_limiter
+                .check(ip_key.as_str(), requests, window_secs),
+        )
     }
 
     /// Build an HTTP error/rejection response.
     ///
     /// If `retry_after` is `Some`, a `Retry-After` header is added (for 429s).
+    /// If `rl_headers` is `Some`, X-RateLimit-* headers are injected.
     fn build_response(
         status: StatusCode,
         message: &str,
         retry_after: Option<u64>,
+        rl_headers: Option<&RateLimitHeaders>,
     ) -> Response<Body> {
         let mut builder = Response::builder()
             .status(status)
@@ -182,6 +203,12 @@ impl RoxyHandler {
             .header("Content-Length", message.len());
         if let Some(secs) = retry_after {
             builder = builder.header("Retry-After", secs.to_string());
+        }
+        if let Some(rl) = rl_headers {
+            builder = builder
+                .header("X-RateLimit-Limit", rl.limit)
+                .header("X-RateLimit-Remaining", rl.remaining)
+                .header("X-RateLimit-Reset", rl.reset_after_secs);
         }
         builder
             .body(Body::from(message.to_string()))
@@ -219,6 +246,12 @@ impl HttpHandler for RoxyHandler {
 
         // Get client IP as IpAddr (no formatting unless needed)
         let client_ip = ctx.client_addr.ip();
+
+        // Health endpoint: respond directly when the request targets the proxy
+        // itself (origin-form URI with no authority), not when proxied through.
+        if req.uri().authority().is_none() && path == "/healthz" {
+            return Self::build_response(StatusCode::OK, "ok", None, None).into();
+        }
 
         // For CONNECT requests (HTTPS tunnel establishment), skip rule evaluation.
         // Rules will be evaluated on the actual HTTP request inside the tunnel.
@@ -280,7 +313,8 @@ impl HttpHandler for RoxyHandler {
                         status = 403,
                         headers = ?logged_headers
                     );
-                    return Self::build_response(StatusCode::FORBIDDEN, "Not Allowed", None).into();
+                    return Self::build_response(StatusCode::FORBIDDEN, "Not Allowed", None, None)
+                        .into();
                 }
                 Action::Pass => {
                     debug!(target: "rules", rule = %rule_name, action = "pass");
@@ -299,9 +333,21 @@ impl HttpHandler for RoxyHandler {
                     mangle,
                 } => {
                     // IP baseline check: prevent bypass by varying header values
-                    if let Some(RateLimitResult::Limited { retry_after_secs }) = self
-                        .check_ip_baseline(rule_name, key_expr, *requests, *window_secs, &eval_ctx)
-                    {
+                    if let Some(RateLimitResult::Limited {
+                        retry_after_secs,
+                        limit,
+                    }) = self.check_ip_baseline(
+                        rule_name,
+                        key_expr,
+                        *requests,
+                        *window_secs,
+                        &eval_ctx,
+                    ) {
+                        let rl = RateLimitHeaders {
+                            limit,
+                            remaining: 0,
+                            reset_after_secs: retry_after_secs,
+                        };
                         info!(
                             target: "proxy",
                             method = %method,
@@ -317,13 +363,18 @@ impl HttpHandler for RoxyHandler {
                             StatusCode::TOO_MANY_REQUESTS,
                             "Rate limit exceeded",
                             Some(retry_after_secs),
+                            Some(&rl),
                         )
                         .into();
                     }
 
                     // Per-key rate limit check
                     match self.check_rate_limit(key_expr, *requests, *window_secs, &eval_ctx) {
-                        RateLimitResult::Allowed { remaining } => {
+                        RateLimitResult::Allowed {
+                            remaining,
+                            limit,
+                            reset_after_secs,
+                        } => {
                             if let Some(delay_ms) =
                                 self.compute_throttle_delay(rule_name, remaining, *requests)
                             {
@@ -333,13 +384,26 @@ impl HttpHandler for RoxyHandler {
                             } else {
                                 debug!(target: "ratelimit", rule = %rule_name, remaining);
                             }
+                            self.pending_ratelimit_headers = Some(RateLimitHeaders {
+                                limit,
+                                remaining,
+                                reset_after_secs,
+                            });
                             if *mangle {
                                 mangle_rules.push_name(rule_name);
                             }
                             matched_rule = Some(rule_name);
                             matched_headers = logged_headers;
                         }
-                        RateLimitResult::Limited { retry_after_secs } => {
+                        RateLimitResult::Limited {
+                            retry_after_secs,
+                            limit,
+                        } => {
+                            let rl = RateLimitHeaders {
+                                limit,
+                                remaining: 0,
+                                reset_after_secs: retry_after_secs,
+                            };
                             info!(
                                 target: "proxy",
                                 method = %method,
@@ -354,6 +418,7 @@ impl HttpHandler for RoxyHandler {
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "Rate limit exceeded",
                                 Some(retry_after_secs),
+                                Some(&rl),
                             )
                             .into();
                         }
@@ -365,8 +430,17 @@ impl HttpHandler for RoxyHandler {
                     let key = extract_key(key_expr, &eval_ctx);
                     let credit_result = self.credit_manager.check(rule_name, &key);
                     match credit_result {
-                        CreditResult::Allowed { remaining } => {
+                        CreditResult::Allowed {
+                            remaining,
+                            limit,
+                            reset_after_secs,
+                        } => {
                             debug!(target: "credit", rule = %rule_name, remaining);
+                            self.pending_ratelimit_headers = Some(RateLimitHeaders {
+                                limit,
+                                remaining,
+                                reset_after_secs,
+                            });
                             if *mangle {
                                 mangle_rules.push_name(rule_name);
                             }
@@ -376,9 +450,16 @@ impl HttpHandler for RoxyHandler {
                         CreditResult::Throttled {
                             remaining,
                             delay_ms,
+                            limit,
+                            reset_after_secs,
                         } => {
                             debug!(target: "credit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
                             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            self.pending_ratelimit_headers = Some(RateLimitHeaders {
+                                limit,
+                                remaining,
+                                reset_after_secs,
+                            });
                             if *mangle {
                                 mangle_rules.push_name(rule_name);
                             }
@@ -407,6 +488,7 @@ impl HttpHandler for RoxyHandler {
                                 StatusCode::TOO_MANY_REQUESTS,
                                 &message,
                                 Some(retry_after_secs),
+                                None,
                             )
                             .into();
                         }
@@ -421,15 +503,21 @@ impl HttpHandler for RoxyHandler {
                     ..
                 } => {
                     // Step 0: IP baseline check (prevents header-flooding bypass)
-                    if let Some(RateLimitResult::Limited { retry_after_secs }) = self
-                        .check_ip_baseline(
-                            rule_name,
-                            rate_key_expr,
-                            *requests,
-                            *window_secs,
-                            &eval_ctx,
-                        )
-                    {
+                    if let Some(RateLimitResult::Limited {
+                        retry_after_secs,
+                        limit,
+                    }) = self.check_ip_baseline(
+                        rule_name,
+                        rate_key_expr,
+                        *requests,
+                        *window_secs,
+                        &eval_ctx,
+                    ) {
+                        let rl = RateLimitHeaders {
+                            limit,
+                            remaining: 0,
+                            reset_after_secs: retry_after_secs,
+                        };
                         info!(
                             target: "proxy",
                             method = %method,
@@ -445,13 +533,22 @@ impl HttpHandler for RoxyHandler {
                             StatusCode::TOO_MANY_REQUESTS,
                             "Rate limit exceeded",
                             Some(retry_after_secs),
+                            Some(&rl),
                         )
                         .into();
                     }
 
                     // Step 1: Per-key rate limit check (burst protection)
                     match self.check_rate_limit(rate_key_expr, *requests, *window_secs, &eval_ctx) {
-                        RateLimitResult::Limited { retry_after_secs } => {
+                        RateLimitResult::Limited {
+                            retry_after_secs,
+                            limit,
+                        } => {
+                            let rl = RateLimitHeaders {
+                                limit,
+                                remaining: 0,
+                                reset_after_secs: retry_after_secs,
+                            };
                             info!(
                                 target: "proxy",
                                 method = %method,
@@ -466,10 +563,22 @@ impl HttpHandler for RoxyHandler {
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "Rate limit exceeded",
                                 Some(retry_after_secs),
+                                Some(&rl),
                             )
                             .into();
                         }
-                        RateLimitResult::Allowed { remaining } => {
+                        RateLimitResult::Allowed {
+                            remaining,
+                            limit,
+                            reset_after_secs,
+                        } => {
+                            // Store rate limit headers (may be overridden by credit below)
+                            self.pending_ratelimit_headers = Some(RateLimitHeaders {
+                                limit,
+                                remaining,
+                                reset_after_secs,
+                            });
+
                             // Step 2: Credit check (budget enforcement)
                             let credit_key = extract_key(credit_key_expr, &eval_ctx);
                             let credit_result = self.credit_manager.check(rule_name, &credit_key);
@@ -496,13 +605,22 @@ impl HttpHandler for RoxyHandler {
                                         StatusCode::TOO_MANY_REQUESTS,
                                         &message,
                                         Some(retry_after_secs),
+                                        self.pending_ratelimit_headers.as_ref(),
                                     )
                                     .into();
                                 }
                                 CreditResult::Throttled {
                                     remaining: _,
                                     delay_ms: credit_delay,
+                                    limit: credit_limit,
+                                    reset_after_secs: credit_reset,
                                 } => {
+                                    // Use credit limits for headers (they represent the budget)
+                                    self.pending_ratelimit_headers = Some(RateLimitHeaders {
+                                        limit: credit_limit,
+                                        remaining: 0,
+                                        reset_after_secs: credit_reset,
+                                    });
                                     let rl_delay = self
                                         .compute_throttle_delay(rule_name, remaining, *requests)
                                         .unwrap_or(0);
@@ -516,7 +634,17 @@ impl HttpHandler for RoxyHandler {
                                     matched_rule = Some(rule_name);
                                     matched_headers = logged_headers;
                                 }
-                                CreditResult::Allowed { remaining: _ } => {
+                                CreditResult::Allowed {
+                                    remaining: credit_remaining,
+                                    limit: credit_limit,
+                                    reset_after_secs: credit_reset,
+                                } => {
+                                    // Use credit limits for headers (they represent the budget)
+                                    self.pending_ratelimit_headers = Some(RateLimitHeaders {
+                                        limit: credit_limit,
+                                        remaining: credit_remaining,
+                                        reset_after_secs: credit_reset,
+                                    });
                                     if let Some(delay_ms) =
                                         self.compute_throttle_delay(rule_name, remaining, *requests)
                                     {
@@ -601,8 +729,18 @@ impl HttpHandler for RoxyHandler {
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
-        // Pass through responses unchanged for now
-        // Future: could add response filtering/modification here
+        // Inject X-RateLimit-* headers if a rate limit rule was evaluated
+        if let Some(rl) = self.pending_ratelimit_headers.take() {
+            let (mut parts, body) = res.into_parts();
+            parts.headers.insert("X-RateLimit-Limit", rl.limit.into());
+            parts
+                .headers
+                .insert("X-RateLimit-Remaining", rl.remaining.into());
+            parts
+                .headers
+                .insert("X-RateLimit-Reset", rl.reset_after_secs.into());
+            return Response::from_parts(parts, body);
+        }
         res
     }
 }
@@ -610,9 +748,35 @@ impl HttpHandler for RoxyHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{HeaderAddConfig, HeaderMangleConfig, RuleConfig, ThrottleConfig};
     use crate::ratelimit::RateLimiter;
     use crate::rules::RuleIndex;
     use std::time::Duration;
+
+    /// Construct an HttpContext for testing.
+    /// HttpContext is #[non_exhaustive] in hudsucker, so it cannot be constructed
+    /// normally from outside that crate. We use MaybeUninit to write the single
+    /// public field.
+    fn make_http_ctx(addr: std::net::SocketAddr) -> HttpContext {
+        unsafe {
+            let mut ctx = std::mem::MaybeUninit::<HttpContext>::uninit();
+            let ptr = ctx.as_mut_ptr();
+            std::ptr::addr_of_mut!((*ptr).client_addr).write(addr);
+            ctx.assume_init()
+        }
+    }
+
+    fn test_addr() -> std::net::SocketAddr {
+        "127.0.0.1:12345".parse().unwrap()
+    }
+
+    fn make_handler_with_rules(rule_configs: Vec<RuleConfig>) -> RoxyHandler {
+        let index = RuleIndex::from_config(&rule_configs).expect("rules should parse");
+        let rules = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        RoxyHandler::new(rules, rate_limiter, credit_manager, vec![], vec![])
+    }
 
     #[test]
     fn test_parse_request_info() {
@@ -641,20 +805,29 @@ mod tests {
 
     #[test]
     fn test_build_response_error() {
-        let resp = RoxyHandler::build_response(StatusCode::FORBIDDEN, "Forbidden", None);
+        let resp = RoxyHandler::build_response(StatusCode::FORBIDDEN, "Forbidden", None, None);
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert!(resp.headers().get("retry-after").is_none());
     }
 
     #[test]
     fn test_build_response_rate_limit() {
+        let rl = RateLimitHeaders {
+            limit: 100,
+            remaining: 0,
+            reset_after_secs: 60,
+        };
         let resp = RoxyHandler::build_response(
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded",
             Some(60),
+            Some(&rl),
         );
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers().get("retry-after").unwrap(), "60");
+        assert_eq!(resp.headers().get("X-RateLimit-Limit").unwrap(), "100");
+        assert_eq!(resp.headers().get("X-RateLimit-Remaining").unwrap(), "0");
+        assert_eq!(resp.headers().get("X-RateLimit-Reset").unwrap(), "60");
     }
 
     #[test]
@@ -666,5 +839,1305 @@ mod tests {
 
         assert!(handler.header_configs.is_empty());
         assert!(handler.throttle_configs.is_empty());
+        assert!(handler.pending_ratelimit_headers.is_none());
+    }
+
+    #[test]
+    fn test_build_response_no_rl_headers() {
+        let resp = RoxyHandler::build_response(StatusCode::OK, "ok", None, None);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("X-RateLimit-Limit").is_none());
+        assert!(resp.headers().get("X-RateLimit-Remaining").is_none());
+        assert!(resp.headers().get("X-RateLimit-Reset").is_none());
+    }
+
+    #[test]
+    fn test_parse_request_info_no_host() {
+        let req = Request::builder().uri("/path").body(()).unwrap();
+        let (host, path) = RoxyHandler::parse_request_info(&req);
+        assert_eq!(host.as_ref(), "localhost");
+        assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn test_parse_request_info_host_no_port() {
+        let req = Request::builder()
+            .uri("/path")
+            .header("host", "example.com")
+            .body(())
+            .unwrap();
+        let (host, path) = RoxyHandler::parse_request_info(&req);
+        assert_eq!(host.as_ref(), "example.com");
+        assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn test_compute_throttle_delay_no_config() {
+        let rules = Arc::new(RuleIndex::new());
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let handler = RoxyHandler::new(rules, rate_limiter, credit_manager, vec![], vec![]);
+        assert!(
+            handler
+                .compute_throttle_delay("nonexistent", 50, 100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compute_throttle_delay_under_soft_limit() {
+        use crate::config::ThrottleConfig;
+        let rules = Arc::new(RuleIndex::new());
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let throttle = vec![ThrottleConfig {
+            rule: "test-rule".to_string(),
+            soft_limit: 50,
+            max_delay_ms: 1000,
+        }];
+        let handler = RoxyHandler::new(rules, rate_limiter, credit_manager, vec![], throttle);
+        // 60 remaining out of 100 means 40 used, under soft_limit of 50
+        assert!(
+            handler
+                .compute_throttle_delay("test-rule", 60, 100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compute_throttle_delay_over_soft_limit() {
+        use crate::config::ThrottleConfig;
+        let rules = Arc::new(RuleIndex::new());
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let throttle = vec![ThrottleConfig {
+            rule: "test-rule".to_string(),
+            soft_limit: 50,
+            max_delay_ms: 1000,
+        }];
+        let handler = RoxyHandler::new(rules, rate_limiter, credit_manager, vec![], throttle);
+        // 25 remaining out of 100 means 75 used, 25 over soft_limit of 50
+        let delay = handler
+            .compute_throttle_delay("test-rule", 25, 100)
+            .unwrap();
+        assert_eq!(delay, 500); // 25/50 * 1000 = 500
+    }
+
+    // === Coverage: handler creation with header configs ===
+
+    #[test]
+    fn test_handler_with_header_configs() {
+        use crate::config::{HeaderAddConfig, HeaderMangleConfig};
+
+        let rules = Arc::new(RuleIndex::new());
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+
+        let header_configs = vec![HeaderMangleConfig {
+            rules: vec!["rule-a".to_string(), "rule-b".to_string()],
+            add: vec![HeaderAddConfig {
+                name: "X-Added".to_string(),
+                value: "true".to_string(),
+            }],
+            remove: vec!["X-Internal".to_string()],
+        }];
+
+        let handler = RoxyHandler::new(rules, rate_limiter, credit_manager, header_configs, vec![]);
+
+        // Both rule names should be indexed
+        assert!(handler.header_configs.contains_key("rule-a"));
+        assert!(handler.header_configs.contains_key("rule-b"));
+
+        // Verify parsed configs
+        let configs_a = handler.header_configs.get("rule-a").unwrap();
+        assert_eq!(configs_a.len(), 1);
+        assert_eq!(configs_a[0].add.len(), 1);
+        assert_eq!(configs_a[0].remove.len(), 1);
+    }
+
+    #[test]
+    fn test_handler_with_throttle_configs() {
+        use crate::config::ThrottleConfig;
+
+        let rules = Arc::new(RuleIndex::new());
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+
+        let throttle = vec![ThrottleConfig {
+            rule: "rate-rule".to_string(),
+            soft_limit: 80,
+            max_delay_ms: 2000,
+        }];
+
+        let handler = RoxyHandler::new(rules, rate_limiter, credit_manager, vec![], throttle);
+        assert!(handler.throttle_configs.contains_key("rate-rule"));
+    }
+
+    #[test]
+    fn test_compute_throttle_delay_at_exact_soft_limit() {
+        use crate::config::ThrottleConfig;
+        let rules = Arc::new(RuleIndex::new());
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let throttle = vec![ThrottleConfig {
+            rule: "test-rule".to_string(),
+            soft_limit: 50,
+            max_delay_ms: 1000,
+        }];
+        let handler = RoxyHandler::new(rules, rate_limiter, credit_manager, vec![], throttle);
+        // 50 remaining out of 100 means 50 used, exactly at soft_limit
+        assert!(
+            handler
+                .compute_throttle_delay("test-rule", 50, 100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compute_throttle_delay_zero_range() {
+        use crate::config::ThrottleConfig;
+        let rules = Arc::new(RuleIndex::new());
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let throttle = vec![ThrottleConfig {
+            rule: "test-rule".to_string(),
+            soft_limit: 99,
+            max_delay_ms: 500,
+        }];
+        let handler = RoxyHandler::new(rules, rate_limiter, credit_manager, vec![], throttle);
+        // max_requests = 100, soft_limit = 99 → range = 1
+        // remaining = 0 → used = 100, over = 100 - 99 = 1
+        // delay = 1/1 * 500 = 500
+        let delay = handler.compute_throttle_delay("test-rule", 0, 100).unwrap();
+        assert_eq!(delay, 500);
+    }
+
+    // === Async handler tests (exercising handle_request pipeline) ===
+
+    #[tokio::test]
+    async fn test_handle_request_healthz() {
+        let mut handler = make_handler_with_rules(vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+        let req = Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+            _ => panic!("Expected direct response for /healthz"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_connect_passthrough() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "block-all".to_string(),
+            rule: r#"host("*") = block"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+        let req = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("example.com:443")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.method(), http::Method::CONNECT);
+            }
+            _ => panic!("CONNECT should be passed through without rule evaluation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_block_rule() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "block-internal".to_string(),
+            rule: r#"host("*.internal") = block"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+        let req = Request::builder()
+            .uri("http://secret.internal/api")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            }
+            _ => panic!("Expected 403 response for blocked host"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_pass_rule() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "allow-api".to_string(),
+            rule: r#"host("api.*") = pass"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.uri().path(), "/data");
+            }
+            _ => panic!("Expected request to be forwarded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_no_rules_match() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "only-internal".to_string(),
+            rule: r#"host("*.internal") = block"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+        let req = Request::builder()
+            .uri("http://public.com/page")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.uri().host(), Some("public.com"));
+            }
+            _ => panic!("Expected request to be forwarded (no rules matched)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_ternary_else_block() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "require-auth".to_string(),
+            rule: r#"header("X-Auth") = pass : block"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Without X-Auth header → should block (else action)
+        let req = Request::builder()
+            .uri("http://example.com/api")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            }
+            _ => panic!("Expected 403 when header missing"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_ternary_pass_with_header() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "require-auth".to_string(),
+            rule: r#"header("X-Auth") = pass : block"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // With X-Auth header → should pass
+        let req = Request::builder()
+            .uri("http://example.com/api")
+            .header("X-Auth", "token")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(_) => {} // forwarded, good
+            _ => panic!("Expected request to be forwarded when header present"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_rate_limit_allows() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "rate-api".to_string(),
+            rule: r#"host("api.*") = rate_limit(100/s, ip)"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(_) => {
+                assert!(handler.pending_ratelimit_headers.is_some());
+            }
+            _ => panic!("Expected request to be forwarded (rate limit allows)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_rate_limit_exhausted() {
+        let rules = vec![RuleConfig {
+            name: "rate-api".to_string(),
+            rule: r#"host("api.*") = rate_limit(2/s, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let mut handler = RoxyHandler::new(rules, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exhaust the rate limit
+        for _ in 0..3 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        // This one should be rate limited
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert!(resp.headers().get("retry-after").is_some());
+                assert!(resp.headers().get("X-RateLimit-Limit").is_some());
+            }
+            _ => panic!("Expected 429 response after rate limit exhausted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_mangle_adds_headers() {
+        let rules = vec![RuleConfig {
+            name: "mangle-rule".to_string(),
+            rule: r#"host("api.*") = mangle"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let header_configs = vec![HeaderMangleConfig {
+            rules: vec!["mangle-rule".to_string()],
+            add: vec![HeaderAddConfig {
+                name: "X-Proxy-Processed".to_string(),
+                value: "true".to_string(),
+            }],
+            remove: vec!["X-Internal".to_string()],
+        }];
+        let mut handler = RoxyHandler::new(
+            rules_arc,
+            rate_limiter,
+            credit_manager,
+            header_configs,
+            vec![],
+        );
+        let http_ctx = make_http_ctx(test_addr());
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .header("X-Internal", "secret")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.headers().get("X-Proxy-Processed").unwrap(), "true");
+                assert!(
+                    r.headers().get("X-Internal").is_none(),
+                    "X-Internal should be removed"
+                );
+            }
+            _ => panic!("Expected request to be forwarded with modified headers"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_injects_ratelimit_headers() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "rate-api".to_string(),
+            rule: r#"host("api.*") = rate_limit(100/s, ip)"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // First, handle a request to set pending_ratelimit_headers
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        handler.handle_request(&http_ctx, req).await;
+
+        // Now handle the response — should inject X-RateLimit-* headers
+        let resp = Response::builder().status(200).body(Body::empty()).unwrap();
+        let result = handler.handle_response(&http_ctx, resp).await;
+        assert!(result.headers().get("X-RateLimit-Limit").is_some());
+        assert!(result.headers().get("X-RateLimit-Remaining").is_some());
+        assert!(result.headers().get("X-RateLimit-Reset").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_handle_response_no_ratelimit_headers() {
+        let mut handler = make_handler_with_rules(vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // No rate limit was applied, so no headers should be injected
+        let resp = Response::builder().status(200).body(Body::empty()).unwrap();
+        let result = handler.handle_response(&http_ctx, resp).await;
+        assert!(result.headers().get("X-RateLimit-Limit").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_rate_limit_with_header_key() {
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "rate-by-header".to_string(),
+            rule: r#"host("api.*") = rate_limit(100/s, header(X-Customer-Id))"#.to_string(),
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .header("X-Customer-Id", "customer-1")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(_) => {
+                // IP baseline check + per-key check both passed
+                assert!(handler.pending_ratelimit_headers.is_some());
+            }
+            _ => panic!("Expected request to be forwarded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_credit_allows() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "credit-rule".to_string(),
+            rule: r#"host("api.*") = credit(1000/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "credit-rule".to_string(),
+            CreditRuleConfig {
+                budget: 1000,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(_) => {
+                assert!(handler.pending_ratelimit_headers.is_some());
+            }
+            _ => panic!("Expected request to be forwarded (credit allows)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_credit_exhausted() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "credit-rule".to_string(),
+            rule: r#"host("api.*") = credit(2/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "credit-rule".to_string(),
+            CreditRuleConfig {
+                budget: 2,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "Credits exhausted until {reset_time}".to_string(),
+            },
+        );
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exhaust credits
+        for _ in 0..3 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        // This should be rejected
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected 429 response when credits exhausted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_rate_limit_with_mangle() {
+        let rules = vec![RuleConfig {
+            name: "rl-mangle".to_string(),
+            rule: r#"host("api.*") = rate_limit(100/s, ip) + mangle"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let header_configs = vec![HeaderMangleConfig {
+            rules: vec!["rl-mangle".to_string()],
+            add: vec![HeaderAddConfig {
+                name: "X-Rate-Limited".to_string(),
+                value: "attached".to_string(),
+            }],
+            remove: vec![],
+        }];
+        let mut handler = RoxyHandler::new(
+            rules_arc,
+            rate_limiter,
+            credit_manager,
+            header_configs,
+            vec![],
+        );
+        let http_ctx = make_http_ctx(test_addr());
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.headers().get("X-Rate-Limited").unwrap(), "attached");
+            }
+            _ => panic!("Expected forwarded request with mangle headers"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_composite_rate_limit_credit() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "composite-rule".to_string(),
+            rule: r#"host("api.*") = rate_limit(100/s, ip) + credit(1000/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "composite-rule".to_string(),
+            CreditRuleConfig {
+                budget: 1000,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(_) => {
+                assert!(handler.pending_ratelimit_headers.is_some());
+            }
+            _ => panic!("Expected forwarded request (composite allows)"),
+        }
+    }
+
+    // === Coverage: IP baseline exhaustion for rate_limit with header key ===
+
+    #[tokio::test]
+    async fn test_handle_request_rate_limit_ip_baseline_exhausted() {
+        let rules = vec![RuleConfig {
+            name: "rl-header".to_string(),
+            rule: r#"host("api.*") = rate_limit(2/s, header(X-Id))"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exhaust IP baseline (limit=2/s) by varying header values
+        for i in 0..3 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .header("X-Id", format!("user-{i}"))
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .header("X-Id", "user-new")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected 429 from IP baseline"),
+        }
+    }
+
+    // === Coverage: rate_limit allowed + throttle (soft limit exceeded) ===
+
+    #[tokio::test]
+    async fn test_handle_request_rate_limit_throttled() {
+        let rules = vec![RuleConfig {
+            name: "rl-throttle".to_string(),
+            rule: r#"host("api.*") = rate_limit(10/s, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let throttle = vec![ThrottleConfig {
+            rule: "rl-throttle".to_string(),
+            soft_limit: 2,
+            max_delay_ms: 10, // small to keep test fast
+        }];
+        let mut handler =
+            RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], throttle);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Send 5 requests to exceed soft_limit of 2
+        for _ in 0..5 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        // Should still be allowed (throttled, not rejected)
+        assert!(handler.pending_ratelimit_headers.is_some());
+    }
+
+    // === Coverage: credit allowed with mangle ===
+
+    #[tokio::test]
+    async fn test_handle_request_credit_allowed_with_mangle() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "credit-mangle".to_string(),
+            rule: r#"host("api.*") = credit(1000/d, ip) + mangle"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "credit-mangle".to_string(),
+            CreditRuleConfig {
+                budget: 1000,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let header_configs = vec![HeaderMangleConfig {
+            rules: vec!["credit-mangle".to_string()],
+            add: vec![HeaderAddConfig {
+                name: "X-Credit".to_string(),
+                value: "ok".to_string(),
+            }],
+            remove: vec![],
+        }];
+        let mut handler = RoxyHandler::new(
+            rules_arc,
+            rate_limiter,
+            credit_manager,
+            header_configs,
+            vec![],
+        );
+        let http_ctx = make_http_ctx(test_addr());
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.headers().get("X-Credit").unwrap(), "ok");
+            }
+            _ => panic!("Expected forwarded request with mangle header"),
+        }
+    }
+
+    // === Coverage: credit throttled (soft limit exceeded) ===
+
+    #[tokio::test]
+    async fn test_handle_request_credit_throttled() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "credit-throttle".to_string(),
+            rule: r#"host("api.*") = credit(10/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "credit-throttle".to_string(),
+            CreditRuleConfig {
+                budget: 10,
+                soft_limit: Some(2),
+                max_delay_ms: 10, // small to keep test fast
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Send 5 requests — first 2 under soft_limit, next 3 throttled
+        for _ in 0..5 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        assert!(handler.pending_ratelimit_headers.is_some());
+    }
+
+    // === Coverage: credit throttled with mangle ===
+
+    #[tokio::test]
+    async fn test_handle_request_credit_throttled_with_mangle() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "credit-thr-m".to_string(),
+            rule: r#"host("api.*") = credit(10/d, ip) + mangle"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "credit-thr-m".to_string(),
+            CreditRuleConfig {
+                budget: 10,
+                soft_limit: Some(2),
+                max_delay_ms: 10,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let header_configs = vec![HeaderMangleConfig {
+            rules: vec!["credit-thr-m".to_string()],
+            add: vec![HeaderAddConfig {
+                name: "X-Throttled".to_string(),
+                value: "yes".to_string(),
+            }],
+            remove: vec![],
+        }];
+        let mut handler = RoxyHandler::new(
+            rules_arc,
+            rate_limiter,
+            credit_manager,
+            header_configs,
+            vec![],
+        );
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exceed soft_limit
+        for _ in 0..5 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.headers().get("X-Throttled").unwrap(), "yes");
+            }
+            _ => panic!("Expected forwarded request with mangle header"),
+        }
+    }
+
+    // === Coverage: RateLimitCredit — IP baseline exhausted ===
+
+    #[tokio::test]
+    async fn test_handle_request_rlc_ip_baseline_exhausted() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "rlc-ip".to_string(),
+            rule: r#"host("api.*") = rate_limit(2/s, header(X-Id)) + credit(1000/d, ip)"#
+                .to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "rlc-ip".to_string(),
+            CreditRuleConfig {
+                budget: 1000,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exhaust IP baseline (2/s) by varying header values
+        for i in 0..3 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .header("X-Id", format!("user-{i}"))
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .header("X-Id", "user-new")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected 429 from RLC IP baseline"),
+        }
+    }
+
+    // === Coverage: RateLimitCredit — per-key rate limit exhausted ===
+
+    #[tokio::test]
+    async fn test_handle_request_rlc_rate_limited() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "rlc-rl".to_string(),
+            rule: r#"host("api.*") = rate_limit(2/s, ip) + credit(1000/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "rlc-rl".to_string(),
+            CreditRuleConfig {
+                budget: 1000,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exhaust per-key rate limit (2/s by ip)
+        for _ in 0..3 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected 429 from RLC per-key rate limit"),
+        }
+    }
+
+    // === Coverage: RateLimitCredit — credit exhausted after rate limit passes ===
+
+    #[tokio::test]
+    async fn test_handle_request_rlc_credit_exhausted() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "rlc-cx".to_string(),
+            rule: r#"host("api.*") = rate_limit(100/s, ip) + credit(2/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "rlc-cx".to_string(),
+            CreditRuleConfig {
+                budget: 2,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "Credits exhausted until {reset_time}".to_string(),
+            },
+        );
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exhaust credits (budget=2)
+        for _ in 0..3 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("Expected 429 from RLC credit exhausted"),
+        }
+    }
+
+    // === Coverage: RateLimitCredit — credit throttled (composite throttle) ===
+
+    #[tokio::test]
+    async fn test_handle_request_rlc_credit_throttled() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "rlc-ct".to_string(),
+            rule: r#"host("api.*") = rate_limit(100/s, ip) + credit(10/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "rlc-ct".to_string(),
+            CreditRuleConfig {
+                budget: 10,
+                soft_limit: Some(2),
+                max_delay_ms: 10,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exceed credit soft_limit of 2
+        for _ in 0..5 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        // Should still be allowed (throttled, not exhausted)
+        assert!(handler.pending_ratelimit_headers.is_some());
+    }
+
+    // === Coverage: RateLimitCredit — credit throttled with mangle ===
+
+    #[tokio::test]
+    async fn test_handle_request_rlc_credit_throttled_with_mangle() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "rlc-ctm".to_string(),
+            rule: r#"host("api.*") = rate_limit(100/s, ip) + credit(10/d, ip) + mangle"#
+                .to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "rlc-ctm".to_string(),
+            CreditRuleConfig {
+                budget: 10,
+                soft_limit: Some(2),
+                max_delay_ms: 10,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let header_configs = vec![HeaderMangleConfig {
+            rules: vec!["rlc-ctm".to_string()],
+            add: vec![HeaderAddConfig {
+                name: "X-Composite".to_string(),
+                value: "yes".to_string(),
+            }],
+            remove: vec![],
+        }];
+        let mut handler = RoxyHandler::new(
+            rules_arc,
+            rate_limiter,
+            credit_manager,
+            header_configs,
+            vec![],
+        );
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exceed credit soft_limit
+        for _ in 0..5 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.headers().get("X-Composite").unwrap(), "yes");
+            }
+            _ => panic!("Expected forwarded request with mangle header"),
+        }
+    }
+
+    // === Coverage: RateLimitCredit — credit allowed + RL throttle ===
+
+    #[tokio::test]
+    async fn test_handle_request_rlc_credit_allowed_rl_throttled() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "rlc-art".to_string(),
+            rule: r#"host("api.*") = rate_limit(10/s, ip) + credit(1000/d, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "rlc-art".to_string(),
+            CreditRuleConfig {
+                budget: 1000,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let throttle = vec![ThrottleConfig {
+            rule: "rlc-art".to_string(),
+            soft_limit: 2,
+            max_delay_ms: 10, // small to keep test fast
+        }];
+        let mut handler =
+            RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], throttle);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Send 5 requests to exceed RL soft_limit of 2
+        for _ in 0..5 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        // Credit ok, RL throttled
+        assert!(handler.pending_ratelimit_headers.is_some());
+    }
+
+    // === Coverage: RateLimitCredit — credit allowed + RL throttle + mangle ===
+
+    #[tokio::test]
+    async fn test_handle_request_rlc_credit_allowed_rl_throttled_mangle() {
+        use crate::ratelimit::CreditRuleConfig;
+        use crate::ratelimit::ResetSchedule;
+
+        let rules = vec![RuleConfig {
+            name: "rlc-artm".to_string(),
+            rule: r#"host("api.*") = rate_limit(10/s, ip) + credit(1000/d, ip) + mangle"#
+                .to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        credit_manager.register_rule(
+            "rlc-artm".to_string(),
+            CreditRuleConfig {
+                budget: 1000,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        let throttle = vec![ThrottleConfig {
+            rule: "rlc-artm".to_string(),
+            soft_limit: 2,
+            max_delay_ms: 10,
+        }];
+        let header_configs = vec![HeaderMangleConfig {
+            rules: vec!["rlc-artm".to_string()],
+            add: vec![HeaderAddConfig {
+                name: "X-RLC".to_string(),
+                value: "throttled".to_string(),
+            }],
+            remove: vec![],
+        }];
+        let mut handler = RoxyHandler::new(
+            rules_arc,
+            rate_limiter,
+            credit_manager,
+            header_configs,
+            throttle,
+        );
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exceed RL soft_limit
+        for _ in 0..5 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Request(r) => {
+                assert_eq!(r.headers().get("X-RLC").unwrap(), "throttled");
+            }
+            _ => panic!("Expected forwarded request with mangle header"),
+        }
+    }
+
+    // === Coverage: rate_limit per-key Limited (not IP baseline) ===
+
+    #[tokio::test]
+    async fn test_handle_request_rate_limit_per_key_limited() {
+        let rules = vec![RuleConfig {
+            name: "rl-pk".to_string(),
+            rule: r#"host("api.*") = rate_limit(2/s, ip)"#.to_string(),
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let rules_arc = Arc::new(index);
+        let rate_limiter = Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let credit_manager = Arc::new(CreditManager::new());
+        let mut handler = RoxyHandler::new(rules_arc, rate_limiter, credit_manager, vec![], vec![]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Exhaust per-key limit (2/s by ip, no header extractor → no IP baseline)
+        for _ in 0..3 {
+            let req = Request::builder()
+                .uri("http://api.example.com/data")
+                .body(Body::empty())
+                .unwrap();
+            handler.handle_request(&http_ctx, req).await;
+        }
+
+        let req = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req).await;
+        match result {
+            RequestOrResponse::Response(resp) => {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert!(resp.headers().get("X-RateLimit-Limit").is_some());
+            }
+            _ => panic!("Expected 429 from per-key rate limit"),
+        }
     }
 }

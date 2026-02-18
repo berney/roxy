@@ -151,34 +151,55 @@ cargo test ratelimit
 
 ### Test Coverage
 
-| Module | Scope |
-|--------|-------|
-| `src/rules/parser.rs` | DSL syntax parsing |
-| `src/rules/ast.rs` | Expression evaluation logic |
-| `src/rules/engine.rs` | Rule matching with mock requests |
-| `src/ratelimit/limiter.rs` | Sliding window edge cases |
-| `src/ratelimit/credit.rs` | Budget, throttling, resets, cleanup |
-| `src/config/types.rs` | YAML parsing and validation |
-| `src/proxy/handler.rs` | Request processing |
+Coverage is measured with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin) (LLVM engine, library code only):
+
+```bash
+cargo tarpaulin --config tarpaulin.toml --lib   # Run coverage
+```
+
+| Module | Coverage | Scope |
+|--------|----------|-------|
+| `src/proxy/handler.rs` | 99% | Full request pipeline, throttling, composites |
+| `src/config/types.rs` | 98% | YAML parsing and validation |
+| `src/rules/ast.rs` | 98% | Expression evaluation logic |
+| `src/rules/engine.rs` | 94% | Rule matching, mangle collection, warnings |
+| `src/rules/key.rs` | 93% | Key extraction (IP, header, composite) |
+| `src/ratelimit/limiter.rs` | 100% | Sliding window, rotation, cleanup |
+| `src/ratelimit/credit.rs` | 90% | Budget, throttling, resets, cleanup |
+| `src/rules/parser.rs` | 80% | DSL syntax parsing |
+| **Overall** | **91%** | Library code (excludes `main.rs`) |
 
 ## Benchmarks
 
+Two benchmark suites using [Criterion](https://crates.io/crates/criterion):
+
 ```bash
-cargo bench                        # All benchmarks
-cargo bench -- "rule_parsing"      # Specific group
+cargo bench                              # All benchmarks
+cargo bench --bench rules                # Rule engine benchmarks
+cargo bench --bench request              # Request pipeline benchmarks
+cargo bench -- "rule_parsing"            # Specific group
 cargo bench -- "rule_evaluation"
-cargo bench -- "rate_limiter"
-cargo bench -- "Complex"           # By complexity
-cargo bench -- "/500"              # By rule count
+cargo bench -- "Complex"                 # By complexity
+cargo bench -- "/500"                    # By rule count
 ```
+
+### `rules` bench — Rule engine isolation
 
 | Group | Description |
 |-------|-------------|
-| `rule_parsing` | Parse rules from config into `RuleIndex` |
-| `rule_evaluation` | Single request evaluation against rule set |
+| `rule_parsing` | Parse rules from config into `RuleIndex` (by complexity × count) |
+| `rule_evaluation` | Single request evaluation (by complexity × count × match position) |
 | `bulk_evaluation` | 1000 diverse requests against rule set |
 | `mangle_evaluation` | Collecting mangle rules for header modification |
-| `rate_limiter` | Rate limiter check throughput |
+| `rate_limiter` | Single key, many keys, composite key generation |
+
+### `request` bench — Full pipeline
+
+| Group | Description |
+|-------|-------------|
+| `request_pipeline` | End-to-end evaluate → rate-limit for 5 scenarios |
+| `rate_limiter_patterns` | Burst single key, rotating 100 keys, composite key formatting |
+| `request_throughput` | 1000 mixed requests against 200 rules with rate limiting |
 
 ## Logging
 

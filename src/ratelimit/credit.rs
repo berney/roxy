@@ -7,6 +7,7 @@
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Timelike, Utc, Weekday};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::warn;
 
 use crate::util::StackString;
 
@@ -14,9 +15,18 @@ use crate::util::StackString;
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreditResult {
     /// Request is allowed
-    Allowed { remaining: u64 },
+    Allowed {
+        remaining: u64,
+        limit: u64,
+        reset_after_secs: u64,
+    },
     /// Request is allowed but throttled (soft limit exceeded)
-    Throttled { remaining: u64, delay_ms: u64 },
+    Throttled {
+        remaining: u64,
+        delay_ms: u64,
+        limit: u64,
+        reset_after_secs: u64,
+    },
     /// Credits exhausted
     Exhausted {
         retry_after_secs: u64,
@@ -221,12 +231,23 @@ impl CreditManager {
             None => {
                 return CreditResult::Allowed {
                     remaining: u64::MAX,
+                    limit: u64::MAX,
+                    reset_after_secs: 0,
                 };
             }
         };
 
-        let now_epoch = u64::try_from(Utc::now().timestamp())
-            .expect("system clock is before Unix epoch — check NTP");
+        let now_epoch = match u64::try_from(Utc::now().timestamp()) {
+            Ok(t) => t,
+            Err(_) => {
+                warn!(target: "ratelimit", "System clock is before Unix epoch — check NTP; allowing request");
+                return CreditResult::Allowed {
+                    remaining: u64::MAX,
+                    limit: u64::MAX,
+                    reset_after_secs: 0,
+                };
+            }
+        };
 
         // Fast path: format key on the stack and try get_mut — zero heap alloc
         let total_len = rule_name.len() + 1 + key.len();
@@ -235,11 +256,10 @@ impl CreditManager {
             && stack_key.push(':').is_ok()
             && stack_key.push_str(key).is_ok();
 
-        if fits_stack
-            && let Some(mut entry) = self.buckets.get_mut(stack_key.as_str()) {
-                let bucket = entry.value_mut();
-                return Self::check_bucket(bucket, &config_ref, now_epoch);
-            }
+        if fits_stack && let Some(mut entry) = self.buckets.get_mut(stack_key.as_str()) {
+            let bucket = entry.value_mut();
+            return Self::check_bucket(bucket, &config_ref, now_epoch);
+        }
 
         // Slow path: key not found (or too long for stack) — allocate String for entry()
         let bucket_key = if fits_stack {
@@ -296,6 +316,7 @@ impl CreditManager {
 
         let new_used = bucket.used.fetch_add(1, Ordering::Relaxed) + 1;
         let remaining = config.budget.saturating_sub(new_used);
+        let reset_secs = reset_at.saturating_sub(now_epoch);
 
         // Progressive delay above soft limit
         if let Some(soft_limit) = config.soft_limit
@@ -311,10 +332,16 @@ impl CreditManager {
             return CreditResult::Throttled {
                 remaining,
                 delay_ms,
+                limit: config.budget,
+                reset_after_secs: reset_secs,
             };
         }
 
-        CreditResult::Allowed { remaining }
+        CreditResult::Allowed {
+            remaining,
+            limit: config.budget,
+            reset_after_secs: reset_secs,
+        }
     }
 
     /// Format exhaustion message with {reset_time} interpolation.
@@ -335,8 +362,13 @@ impl CreditManager {
     /// their active window — a user who goes silent for >48h within a
     /// 7-day window must still have their usage tracked.
     pub fn force_cleanup(&self) {
-        let now_epoch = u64::try_from(Utc::now().timestamp())
-            .expect("system clock is before Unix epoch — check NTP");
+        let now_epoch = match u64::try_from(Utc::now().timestamp()) {
+            Ok(t) => t,
+            Err(_) => {
+                warn!(target: "ratelimit", "System clock is before Unix epoch — check NTP; skipping credit cleanup");
+                return;
+            }
+        };
         let expiry_secs = 48 * 3600;
         self.buckets.retain(|_, bucket| {
             let reset_at = bucket.reset_at.load(Ordering::Relaxed);
@@ -472,7 +504,10 @@ mod tests {
         let manager = CreditManager::new();
         manager.register_rule("test-rule".into(), make_test_config(100, None, 2000));
         let result = manager.check("test-rule", "user-1");
-        assert!(matches!(result, CreditResult::Allowed { remaining: 99 }));
+        assert!(matches!(
+            result,
+            CreditResult::Allowed { remaining: 99, .. }
+        ));
     }
 
     #[test]
@@ -542,7 +577,7 @@ mod tests {
         ));
         assert!(matches!(
             manager.check("test-rule", "user-2"),
-            CreditResult::Allowed { remaining: 4 }
+            CreditResult::Allowed { remaining: 4, .. }
         ));
     }
 
@@ -629,9 +664,257 @@ mod tests {
         // Verify the 5 consumed credits are still tracked
         let result = manager.check("weekly-rule", "user-1");
         assert!(
-            matches!(result, CreditResult::Allowed { remaining: 994 }),
+            matches!(result, CreditResult::Allowed { remaining: 994, .. }),
             "expected 994 remaining (5 used + 1 from this check), got {:?}",
             result,
         );
+    }
+
+    // === Coverage: parse_weekday for all days ===
+
+    #[test]
+    fn test_parse_weekly_tuesday() {
+        let schedule = ResetSchedule::parse("weekly@Tue-10:00").unwrap();
+        assert!(matches!(
+            schedule,
+            ResetSchedule::Weekly {
+                day: Weekday::Tue,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_weekly_wednesday() {
+        let schedule = ResetSchedule::parse("weekly@Wed-10:00").unwrap();
+        assert!(matches!(
+            schedule,
+            ResetSchedule::Weekly {
+                day: Weekday::Wed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_weekly_thursday() {
+        let schedule = ResetSchedule::parse("weekly@Thu-10:00").unwrap();
+        assert!(matches!(
+            schedule,
+            ResetSchedule::Weekly {
+                day: Weekday::Thu,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_weekly_friday() {
+        let schedule = ResetSchedule::parse("weekly@Friday-10:00").unwrap();
+        assert!(matches!(
+            schedule,
+            ResetSchedule::Weekly {
+                day: Weekday::Fri,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_weekly_saturday() {
+        let schedule = ResetSchedule::parse("weekly@Sat-10:00").unwrap();
+        assert!(matches!(
+            schedule,
+            ResetSchedule::Weekly {
+                day: Weekday::Sat,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_weekly_sunday() {
+        let schedule = ResetSchedule::parse("weekly@Sunday-10:00").unwrap();
+        assert!(matches!(
+            schedule,
+            ResetSchedule::Weekly {
+                day: Weekday::Sun,
+                ..
+            }
+        ));
+    }
+
+    // === Coverage: weekly schedule past day ===
+
+    #[test]
+    fn test_weekly_reset_past_day() {
+        // If the target weekday already passed this week, next_reset_after should go to next week
+        let schedule = ResetSchedule::Weekly {
+            day: Weekday::Mon,
+            hour: 0,
+            minute: 0,
+        };
+        let now_epoch = Utc::now().timestamp() as u64;
+        let next = schedule.next_reset_after(now_epoch);
+        // The result must be in the future
+        assert!(next > now_epoch || next == now_epoch);
+    }
+
+    // === Coverage: monthly schedule edge cases ===
+
+    #[test]
+    fn test_monthly_reset_invalid_day_fallback() {
+        // Day 31 in February → should fallback to current date
+        let schedule = ResetSchedule::Monthly {
+            day: 31,
+            hour: 0,
+            minute: 0,
+        };
+        // Use a fixed date in Feb
+        let feb_ts = chrono::NaiveDate::from_ymd_opt(2025, 2, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp() as u64;
+        let next = schedule.next_reset_after(feb_ts);
+        assert!(next > feb_ts, "Reset should be in the future, got {}", next);
+    }
+
+    #[test]
+    fn test_monthly_reset_december_wraps() {
+        // In December, next month should be January of next year
+        let schedule = ResetSchedule::Monthly {
+            day: 15,
+            hour: 0,
+            minute: 0,
+        };
+        // Use Dec 20 — day 15 already passed, should wrap to Jan 15
+        let dec_ts = chrono::NaiveDate::from_ymd_opt(2025, 12, 20)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp() as u64;
+        let next = schedule.next_reset_after(dec_ts);
+        assert!(next > dec_ts, "Reset should be in the future");
+        // Convert back to check it's January
+        let next_dt = DateTime::from_timestamp(next as i64, 0).unwrap();
+        assert_eq!(next_dt.month(), 1, "Should wrap to January");
+        assert_eq!(next_dt.year(), 2026, "Should wrap to next year");
+    }
+
+    // === Coverage: credit first request (slow path insert) ===
+
+    #[test]
+    fn test_credit_first_request_inserts_bucket() {
+        let manager = CreditManager::new();
+        manager.register_rule(
+            "first-req".to_string(),
+            CreditRuleConfig {
+                budget: 100,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        // First request should trigger slow path (new key)
+        let result = manager.check("first-req", "new-user");
+        assert!(matches!(
+            result,
+            CreditResult::Allowed { remaining: 99, .. }
+        ));
+        assert_eq!(manager.buckets.len(), 1);
+    }
+
+    // === Coverage: credit reset after window expires ===
+
+    #[test]
+    fn test_credit_reset_after_window_expires() {
+        let manager = CreditManager::new();
+        manager.register_rule(
+            "reset-rule".to_string(),
+            CreditRuleConfig {
+                budget: 10,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+
+        // Consume all credits
+        for _ in 0..10 {
+            manager.check("reset-rule", "user-1");
+        }
+        let result = manager.check("reset-rule", "user-1");
+        assert!(matches!(result, CreditResult::Exhausted { .. }));
+
+        // Manually set reset_at to the past to simulate window expiry
+        if let Some(entry) = manager.buckets.get_mut("reset-rule:user-1") {
+            entry.reset_at.store(1, Ordering::Relaxed);
+        }
+
+        // Next request should reset and allow
+        let result = manager.check("reset-rule", "user-1");
+        assert!(matches!(result, CreditResult::Allowed { remaining: 9, .. }));
+    }
+
+    // === Coverage: format_exhaustion_message ===
+
+    #[test]
+    fn test_format_exhaustion_message_with_config() {
+        let manager = CreditManager::new();
+        manager.register_rule(
+            "msg-rule".to_string(),
+            CreditRuleConfig {
+                budget: 100,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily {
+                    hour: 12,
+                    minute: 0,
+                },
+                message: "Credits exhausted. Resets at {reset_time}".to_string(),
+            },
+        );
+        let msg = manager.format_exhaustion_message("msg-rule", "2025-01-01T12:00:00Z");
+        assert_eq!(msg, "Credits exhausted. Resets at 2025-01-01T12:00:00Z");
+    }
+
+    #[test]
+    fn test_format_exhaustion_message_unknown_rule() {
+        let manager = CreditManager::new();
+        let msg = manager.format_exhaustion_message("unknown", "2025-01-01T12:00:00Z");
+        assert!(msg.contains("2025-01-01T12:00:00Z"));
+    }
+
+    // === Coverage: force_cleanup retains active window and removes stale ===
+
+    #[test]
+    fn test_force_cleanup_removes_expired_not_accessed() {
+        let manager = CreditManager::new();
+        manager.register_rule(
+            "cleanup-rule".to_string(),
+            CreditRuleConfig {
+                budget: 100,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Daily { hour: 0, minute: 0 },
+                message: "exhausted".to_string(),
+            },
+        );
+        // Create a bucket
+        manager.check("cleanup-rule", "stale-user");
+
+        // Set both reset_at and last_access to far in the past
+        if let Some(entry) = manager.buckets.get_mut("cleanup-rule:stale-user") {
+            entry.reset_at.store(1000, Ordering::Relaxed);
+            entry.last_access.store(1000, Ordering::Relaxed);
+        }
+
+        manager.force_cleanup();
+        assert_eq!(manager.buckets.len(), 0, "Stale bucket should be removed");
     }
 }

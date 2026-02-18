@@ -4,6 +4,8 @@
 //! - Number of rules
 //! - Rule complexity (simple, medium, complex)
 
+mod common;
+
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
@@ -11,132 +13,13 @@ use http::Method;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use std::net::IpAddr;
 
-// Import from the crate
 use roxy::rules::{EvalContext, RuleIndex};
 use roxy::config::RuleConfig;
 
-/// Rule complexity levels
-#[derive(Debug, Clone, Copy)]
-enum Complexity {
-    /// Single matcher: `host("example.com") = pass`
-    Simple,
-    /// 2-3 matchers with AND/OR: `host("*.api") && method(GET) = pass`
-    Medium,
-    /// 4+ matchers with nesting, NOT, ternary: `(host("*") && !header("X-Block")) || method(POST) = block : pass`
-    Complex,
-}
-
-/// Generate a rule with specified complexity
-fn generate_rule(index: usize, complexity: Complexity) -> RuleConfig {
-    let (name, rule) = match complexity {
-        Complexity::Simple => {
-            // Rotate through different simple patterns
-            match index % 4 {
-                0 => (
-                    format!("simple-host-{}", index),
-                    format!(r#"host("service-{}.example.com") = pass"#, index),
-                ),
-                1 => (
-                    format!("simple-path-{}", index),
-                    format!(r#"path("/api/v{}/resource") = pass"#, index % 10),
-                ),
-                2 => (
-                    format!("simple-method-{}", index),
-                    format!(r#"method({}) = pass"#, ["GET", "POST", "PUT", "DELETE"][index % 4]),
-                ),
-                _ => (
-                    format!("simple-header-{}", index),
-                    format!(r#"header("X-Request-Id-{}") = pass"#, index),
-                ),
-            }
-        }
-        Complexity::Medium => {
-            match index % 3 {
-                0 => (
-                    format!("medium-auth-{}", index),
-                    format!(
-                        r#"host("api-{}.example.com") && !header("Authorization") = block : pass"#,
-                        index % 100
-                    ),
-                ),
-                1 => (
-                    format!("medium-method-path-{}", index),
-                    format!(
-                        r#"method(GET) && path("/users/{}/profile") = pass"#,
-                        index
-                    ),
-                ),
-                _ => (
-                    format!("medium-or-{}", index),
-                    format!(
-                        r#"host("service-{}.internal") || host("service-{}.local") = block"#,
-                        index, index
-                    ),
-                ),
-            }
-        }
-        Complexity::Complex => {
-            match index % 4 {
-                0 => (
-                    format!("complex-nested-{}", index),
-                    format!(
-                        r#"(host("*.api-{}.com") || host("*.cdn-{}.net")) && method(GET) && !header("X-Block") = pass"#,
-                        index % 50, index % 50
-                    ),
-                ),
-                1 => (
-                    format!("complex-ratelimit-{}", index),
-                    format!(
-                        r#"host("api-{}.example.com") && path("/v1/*") = rate_limit(100/s, header(X-Customer-Id))"#,
-                        index % 100
-                    ),
-                ),
-                2 => (
-                    format!("complex-mangle-{}", index),
-                    format!(
-                        r#"host("backend-{}.internal") && !header("X-Forwarded-For") && method(POST) = mangle"#,
-                        index % 50
-                    ),
-                ),
-                _ => (
-                    format!("complex-multi-{}", index),
-                    format!(
-                        r#"(host("*.example.com") && path("/api/*")) || (host("*.test.com") && header("X-Test-{}:enabled")) = pass"#,
-                        index
-                    ),
-                ),
-            }
-        }
-    };
-
-    RuleConfig { name, rule }
-}
-
-/// Generate a batch of rules with specified count and complexity
-fn generate_rules(count: usize, complexity: Complexity) -> Vec<RuleConfig> {
-    (0..count).map(|i| generate_rule(i, complexity)).collect()
-}
-
-/// Create a RuleIndex from generated rules
-fn build_rule_index(rules: &[RuleConfig]) -> RuleIndex {
-    RuleIndex::from_config(rules).expect("Failed to parse generated rules")
-}
-
-/// Create a test evaluation context
-fn create_eval_context<'a>(
-    host: &'a str,
-    path: &'a str,
-    method: &'a Method,
-    headers: &'a HeaderMap,
-) -> EvalContext<'a> {
-    EvalContext {
-        host,
-        path,
-        method,
-        headers,
-        client_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100))),
-    }
-}
+use common::{
+    Complexity, build_rule_index, create_eval_context, generate_rule, generate_rules,
+    headers_with_auth, headers_without_auth,
+};
 
 /// Benchmark rule parsing throughput
 fn bench_rule_parsing(c: &mut Criterion) {
@@ -166,26 +49,8 @@ fn bench_rule_parsing(c: &mut Criterion) {
 fn bench_rule_evaluation(c: &mut Criterion) {
     let mut group = c.benchmark_group("rule_evaluation");
     
-    // Test contexts that exercise different code paths
-    let mut headers_with_auth = HeaderMap::new();
-    headers_with_auth.insert(
-        HeaderName::from_static("authorization"),
-        HeaderValue::from_static("Bearer token123"),
-    );
-    headers_with_auth.insert(
-        HeaderName::from_static("x-customer-id"),
-        HeaderValue::from_static("cust-42"),
-    );
-    headers_with_auth.insert(
-        HeaderName::from_static("x-request-id-5"),
-        HeaderValue::from_static("req-123"),
-    );
-    
-    let mut headers_without_auth = HeaderMap::new();
-    headers_without_auth.insert(
-        HeaderName::from_static("x-customer-id"),
-        HeaderValue::from_static("cust-42"),
-    );
+    let headers_with_auth = headers_with_auth();
+    let headers_without_auth = headers_without_auth();
     
     // Test scenarios
     let scenarios: Vec<(&str, &str, &str, Method, &HeaderMap)> = vec![
