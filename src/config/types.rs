@@ -309,7 +309,7 @@ impl ProxyConfig {
             }
             if credit.max_delay_ms > MAX_THROTTLE_DELAY_MS {
                 return Err(ConfigError::Invalid(format!(
-                    "Credit '{}': max_delay_ms ({}) exceeds maximum allowed value ({}ms) you can rebuilt with MAX_THROTTLE_DELAY_MS set higher if you need longer delays",
+                    "Credit '{}': max_delay_ms ({}) exceeds maximum allowed value ({}ms); you can rebuild with MAX_THROTTLE_DELAY_MS set higher if you need longer delays",
                     credit.rule, credit.max_delay_ms, MAX_THROTTLE_DELAY_MS
                 )));
             }
