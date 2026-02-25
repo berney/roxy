@@ -1,0 +1,16 @@
+[default]
+# Only measure library code — excludes main.rs binary
+packages = ["roxy"]
+exclude-files = ["main\\.rs$", "benches/", "tests/"]
+# Engine: llvm for accuracy
+engine = "Llvm"
+# Only run lib tests (excludes binary/main.rs from coverage)
+command = "Test"
+run-types = ["Lib"]
+
+# Output formats
+out = ["Stdout", "Html"]
+output-dir = "target/tarpaulin"
+
+# Skip unreachable and test-only code
+ignore-tests = true

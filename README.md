@@ -1,4 +1,7 @@
+
 # Roxy
+
+![](./logo.svg)
 
 [![Docker Hub](https://img.shields.io/docker/v/adsanz/roxy?label=Docker%20Hub)](https://hub.docker.com/r/adsanz/roxy)
 
@@ -8,11 +11,15 @@ Roxy combines ACL filtering, header mangling, rate limiting, and TLS inspection 
 
 ## Features
 
-- **MITM TLS Interception** - Inspect and modify HTTPS traffic transparently
-- **Rule DSL** - Expressive domain-specific language for traffic filtering
-- **Rate Limiting** - Sliding window rate limiter with flexible key extraction
-- **Header Mangling** - Add/remove headers based on rule matches
-- **Method-Indexed Rules** - O(1) rule lookup by HTTP method
+- **MITM TLS Interception** — Inspect and modify HTTPS traffic transparently
+- **Rule DSL** — Expressive domain-specific language for traffic filtering ([docs](docs/rules.md))
+- **Rate Limiting** — Sliding window rate limiter with soft/hard limits and progressive throttling ([docs](docs/rate-limiting.md))
+- **Credit System** — Fixed-budget rate limiting with scheduled resets ([docs](docs/rate-limiting.md))
+- **Header Mangling** — Add/remove headers based on rule matches
+- **Header Logging** — Headers referenced in rules are automatically logged with their values (up to 8 per rule, zero-allocation, configurable via `MAX_LOGGED_HEADERS`)
+- **Hot Reload** — Automatic config reload without restart, preserving rate limit and credit state
+- **Method-Indexed Rules** — O(1) rule lookup by HTTP method
+- **Memory-Conscious** — jemalloc allocator, configurable caches and pools ([docs](docs/memory-tuning.md))
 
 ## Installation
 
@@ -61,304 +68,207 @@ services:
 ### Binary
 
 ```bash
-# Run with a config file
 ./target/release/roxy --config config.yaml
-
-# The proxy will start on the configured listen address (default: 127.0.0.1:8080)
+# Proxy starts on the configured listen address (default: 127.0.0.1:8080)
 ```
 
 ### TLS Certificates
 
 Roxy can operate in two modes:
 
-1. **Ephemeral CA** (default) - Generates a temporary CA certificate on startup. Useful for testing.
-
-2. **Persistent CA** - Provide your own CA certificate and key in the config. Required for production use where clients need to trust the CA.
-
-Generate CA certificates:
+1. **Ephemeral CA** (default) — Generates a temporary CA on startup. Useful for testing.
+2. **Persistent CA** — Provide your own CA cert and key in the config.
 
 ```bash
-# Generate CA private key
 openssl genrsa -out ca.key 4096
-
-# Generate CA certificate
 openssl req -new -x509 -days 3650 -key ca.key -out ca.crt \
     -subj "/CN=Roxy Proxy CA/O=Roxy/C=US"
 ```
 
 ## Configuration
 
-Roxy uses YAML configuration files. Here's a complete example:
+Roxy uses YAML configuration files. See [config.example.yaml](config.example.yaml) for a complete example.
 
 ```yaml
-# Proxy server settings
 listen: "0.0.0.0:8080"
 
-# TLS settings (optional - uses ephemeral CA if omitted)
-tls:
-  ca_cert: "/path/to/ca.crt"
-  ca_key: "/path/to/ca.key"
+pool:
+  max_idle_per_host: 50
+  idle_timeout_secs: 120
 
-# Rule definitions (evaluated in order - first match wins!)
 rules:
-  # Allow health checks without further processing
-  - name: "allow-healthcheck"
-    rule: 'path("/health") && method(GET) = pass'
-
-  # Allow payment endpoint
-  - name: "allow-payment"
-    rule: 'method(POST) && path("/payment") = pass'
-
-  # Require authentication header for API requests
-  - name: "require-auth"
-    rule: 'host("api.example.com") && !header("X-Auth-Token") = block : pass'
-
-  # Rate limit API requests by customer ID
-  - name: "rate-limit-api"
-    rule: 'host("api.*") && path("/v1/*") = rate_limit(100/s, header(X-Customer-Id))'
-
-  # Mark requests for header modification
-  - name: "add-trace-headers"
-    rule: 'host("backend.*") = mangle'
-
-  # Block everything else (catch-all - MUST be last!)
-  - name: "block-all"
-    rule: 'host("*") = block'
-
-# Header modification rules
-headers:
-  - rules: ["add-trace-headers"]  # Apply when these rules trigger mangle action
-    add:
-      - name: "X-Proxy-Processed"
-        value: "true"
-      - name: "X-Forwarded-By"
-        value: "roxy"
-    remove:
-      - "X-Internal-Only"
-      - "X-Debug-Info"
-```
-
-### Rule Evaluation Order
-
-**Rules are evaluated in the exact order they appear in the config file (first-match-wins).**
-
-This is critical for writing correct rules. The proxy stops evaluating rules as soon as one matches and returns an action. To implement allow-list patterns:
-
-```yaml
-rules:
-  # 1. Specific allows FIRST
   - name: "allow-health"
     rule: 'path("/health") = pass'
 
-  - name: "allow-payment"
-    rule: 'path("/payment") = pass'
+  - name: "require-auth"
+    rule: 'path("/admin/*") && !header("Authorization") = block'
 
-  # 2. Catch-all block LAST
-  - name: "block-all"
-    rule: 'host("*") = block'
+  - name: "rate-limit-api"
+    rule: 'path("/api/*") = rate_limit(100/s, header(X-Customer-Id))'
+
+  - name: "allow-all"
+    rule: 'host("*") = pass'
 ```
 
-With this config:
-- `GET /health` → matches rule 1 → **pass** (stops here)
-- `POST /payment` → matches rule 2 → **pass** (stops here)  
-- `GET /anything-else` → matches rule 3 → **block**
+Rules are evaluated **first-match-wins** in config order. For the full rule DSL syntax, matchers, operators, actions, and composite rules, see the [Rule DSL docs](docs/rules.md).
 
-⚠️ **Common mistake**: Putting the catch-all block first would block everything!
+For rate limiting, credit system, throttling, and reset schedules, see [Rate Limiting docs](docs/rate-limiting.md).
 
-### Rule DSL
+For memory tuning (jemalloc, cert cache, connection pool), see [Memory Tuning docs](docs/memory-tuning.md).
 
-**Matchers:**
-| Matcher | Description | Example |
-|---------|-------------|---------|
-| `host("pattern")` | Match request host | `host("*.example.com")` |
-| `path("pattern")` | Match request path | `path("/api/v1/*")` |
-| `method(M)` | Match HTTP method | `method(GET)`, `method(POST)` |
-| `header("name")` | Check header exists | `header("Authorization")` |
-| `header("name:value")` | Match header value | `header("X-Version:v2")` |
+## Hot Reload
 
-**Operators:**
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `&&` | Logical AND | `host("*") && method(GET)` |
-| `\|\|` | Logical OR | `path("/a") \|\| path("/b")` |
-| `!` | Logical NOT | `!header("X-Auth")` |
-| `()` | Grouping | `(host("a") \|\| host("b")) && method(POST)` |
-
-**Actions:**
-| Action | Description |
-|--------|-------------|
-| `pass` | Allow request, stop rule evaluation |
-| `block` | Deny request with 403 Forbidden |
-| `mangle` | Allow request, trigger header modifications |
-| `rate_limit(N/s, key)` | Apply rate limiting |
-
-**Ternary syntax:** `condition = action_if_true : action_if_false`
-
-### Rate Limit Keys
-
-Rate limit keys determine how requests are grouped:
+Roxy automatically detects config file changes and reloads rules, headers, and throttle settings without restarting the proxy. Rate limit counters and credit budgets are **preserved** across reloads.
 
 ```yaml
-# Single key - limit by header value
-rate_limit(100/s, header(X-Customer-Id))
+# Check for config changes every 5 seconds (default)
+reload_interval_secs: 5
 
-# Composite key - limit by combination
-rate_limit(50/s, header(X-Customer-Id) + path(*) + host(*))
-
-# Available key sources: header(Name), path(*), host(*), client_ip(*)
+# Disable hot reload
+reload_interval_secs: 0
 ```
+
+**What reloads:** rules, header mangle config, throttle config, credit rule budgets.
+
+**What is preserved:** rate limit sliding windows, credit usage counters, TLS certificates, connection pools.
+
+**Delta-aware budget changes:**
+
+- **Rate limits** — When you change e.g. `rate_limit(10/s)` → `rate_limit(15/s)`, existing sliding window counters are kept and the new limit applies immediately on the next request. No traffic spike from a counter reset.
+- **Credits** — When you change e.g. `credit(100/d)` → `credit(200/d)`, the current usage is preserved and the extra capacity is available right away. A client that used 60 of 100 credits now has 140 remaining instead of being reset to 200.
+- **Decreases** work the same way: lowering a rate limit or credit budget takes effect instantly. Clients already over the new limit will be rejected until counters naturally expire or reset.
+
+If a new config fails to parse or contains invalid rules, the current config remains active and an error is logged.
 
 ## Architecture
 
 ```
-Request → [TLS Intercept] → [Parse] → [ACL] → [RateLimit] → [Mangle] → [Forward] → Response
+Request → [TLS Intercept] → [Parse] → [ACL] → [RateLimit / Credit / Throttle] → [Mangle] → [Forward] → Response
 ```
 
-### Module Structure
-
-| Module | Responsibility | Key Types |
-|--------|----------------|-----------|
-| `config/` | YAML config parsing | `ProxyConfig`, `RuleConfig` |
-| `rules/` | DSL parsing (nom) + method-indexed evaluation | `Expr`, `Action`, `RuleIndex` |
-| `ratelimit/` | Sliding window rate limiting | `RateLimiter`, `SlidingWindow` |
-| `proxy/` | Hudsucker `HttpHandler` implementation | `RoxyHandler` |
-| `error.rs` | Unified error types | `RoxyError` |
+| Module | Responsibility |
+|--------|----------------|
+| `config/types.rs` | YAML config parsing and validation |
+| `config/reload.rs` | Periodic config file watcher, delta-aware hot reload |
+| `rules/parser.rs` | DSL parsing (nom) |
+| `rules/ast.rs` | Expression types and evaluation |
+| `rules/engine.rs` | Method-indexed rule matching |
+| `rules/key.rs` | Key extraction for rate limiting (IP, header, composite) |
+| `ratelimit/limiter.rs` | Sliding window rate limiting (DashMap) |
+| `ratelimit/credit.rs` | Credit-based rate limiting with scheduled resets |
+| `proxy/handler.rs` | Hudsucker `HttpHandler` — request/response pipeline |
+| `proxy/authority.rs` | Custom CA with full certificate chain for MITM |
+| `error.rs` | Unified error types |
+| `util.rs` | Stack-allocated string utilities (zero-alloc key formatting) |
 
 ### Key Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| [hudsucker](https://crates.io/crates/hudsucker) | MITM HTTP/S proxy framework with TLS interception |
+| [hudsucker](https://crates.io/crates/hudsucker) | MITM HTTP/S proxy framework |
 | [nom](https://crates.io/crates/nom) | Zero-copy parser combinators for the rule DSL |
 | [globset](https://crates.io/crates/globset) | Pre-compiled glob pattern matching |
 | [dashmap](https://crates.io/crates/dashmap) | Concurrent hashmap for rate limit storage |
+| [arc-swap](https://crates.io/crates/arc-swap) | Lock-free atomic config swap for hot reload |
+| [tikv-jemallocator](https://crates.io/crates/tikv-jemallocator) | jemalloc global allocator |
 | [tokio](https://crates.io/crates/tokio) | Async runtime |
 | [tracing](https://crates.io/crates/tracing) | Structured logging |
 
-### Design Decisions
-
-1. **Method-Indexed Rules** - Rules are indexed by `Option<Method>` for O(1) lookup. Rules without a method matcher go in the `None` bucket and are always evaluated.
-
-2. **Pre-compiled Globs** - Glob patterns are compiled to `GlobMatcher` at config load time, not per-request.
-
-3. **Sliding Window Rate Limiting** - Uses a time-bucketed sliding window algorithm stored in `DashMap` for lock-free concurrent access.
-
-4. **Error Layering** - Each layer defines its own error type. Lower layers report what failed; upper layers decide HTTP status codes.
-
 ## Testing
 
-Run the test suite:
-
 ```bash
-# Run all tests
-cargo test
-
-# Run tests with output
-cargo test -- --nocapture
-
-# Run specific test module
-cargo test rules::parser
+cargo test                    # Run all tests
+cargo test -- --nocapture     # With output
+cargo test rules::parser      # Specific module
 cargo test ratelimit
 ```
 
 ### Test Coverage
 
-- **Parser tests** (`src/rules/parser.rs`) - DSL syntax parsing
-- **AST tests** (`src/rules/ast.rs`) - Expression evaluation logic
-- **Engine tests** (`src/rules/engine.rs`) - Rule matching with mock requests
-- **Rate limiter tests** (`src/ratelimit/limiter.rs`) - Sliding window edge cases
-- **Config tests** (`src/config/types.rs`) - YAML parsing and validation
-- **Handler tests** (`src/proxy/handler.rs`) - Request processing
+Coverage is measured with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin) (LLVM engine, library code only):
+
+```bash
+cargo tarpaulin --config tarpaulin.toml --lib   # Run coverage
+```
+
+| Module | Coverage | Scope |
+|--------|----------|-------|
+| `src/proxy/handler.rs` | 99% | Full request pipeline, throttling, composites |
+| `src/config/types.rs` | 98% | YAML parsing and validation |
+| `src/rules/ast.rs` | 98% | Expression evaluation logic |
+| `src/rules/engine.rs` | 94% | Rule matching, mangle collection, warnings |
+| `src/rules/key.rs` | 93% | Key extraction (IP, header, composite) |
+| `src/ratelimit/limiter.rs` | 100% | Sliding window, rotation, cleanup |
+| `src/ratelimit/credit.rs` | 90% | Budget, throttling, resets, cleanup |
+| `src/rules/parser.rs` | 80% | DSL syntax parsing |
+| **Overall** | **91%** | Library code (excludes `main.rs`) |
 
 ## Benchmarks
 
-Benchmarks measure rule parsing and evaluation throughput across different complexity levels and rule counts.
-
-### Running Benchmarks
+Two benchmark suites using [Criterion](https://crates.io/crates/criterion):
 
 ```bash
-# Run all benchmarks
-cargo bench
-
-# Run specific benchmark group
-cargo bench -- "rule_parsing"
+cargo bench                              # All benchmarks
+cargo bench --bench rules                # Rule engine benchmarks
+cargo bench --bench request              # Request pipeline benchmarks
+cargo bench -- "rule_parsing"            # Specific group
 cargo bench -- "rule_evaluation"
-cargo bench -- "bulk_evaluation"
-cargo bench -- "rate_limiter"
-
-# Run benchmarks for specific complexity
-cargo bench -- "Complex"
-cargo bench -- "rule_evaluation/Medium"
-
-# Run with specific rule count
-cargo bench -- "/500"
+cargo bench -- "Complex"                 # By complexity
+cargo bench -- "/500"                    # By rule count
 ```
 
-### Benchmark Groups
+### `rules` bench — Rule engine isolation
 
 | Group | Description |
 |-------|-------------|
-| `rule_parsing` | Time to parse rules from config into `RuleIndex` |
-| `rule_evaluation` | Single request evaluation against rule set |
+| `rule_parsing` | Parse rules from config into `RuleIndex` (by complexity × count) |
+| `rule_evaluation` | Single request evaluation (by complexity × count × match position) |
 | `bulk_evaluation` | 1000 diverse requests against rule set |
 | `mangle_evaluation` | Collecting mangle rules for header modification |
-| `rate_limiter` | Rate limiter check throughput |
+| `rate_limiter` | Single key, many keys, composite key generation |
 
-### Complexity Levels
+### `request` bench — Full pipeline
 
-- **Simple** - Single matcher: `host("example.com") = pass`
-- **Medium** - 2-3 matchers with operators: `host("*.api") && method(GET) = pass`
-- **Complex** - 4+ matchers with nesting, NOT, ternary: `(host("*") && !header("X-Block")) || method(POST) = block : pass`
-
-### Example Output
-
-```
-rule_parsing/Simple/100   time: [5.5 ms]  thrpt: [18.0 Kelem/s]
-rule_parsing/Complex/100  time: [12.3 ms] thrpt: [8.1 Kelem/s]
-
-rule_evaluation/Simple/1000/match_early    time: [245 ns]
-rule_evaluation/Complex/1000/no_match      time: [1.2 µs]
-
-bulk_evaluation/Medium_rules_200           thrpt: [1.8 Melem/s]
-```
+| Group | Description |
+|-------|-------------|
+| `request_pipeline` | End-to-end evaluate → rate-limit for 5 scenarios |
+| `rate_limiter_patterns` | Burst single key, rotating 100 keys, composite key formatting |
+| `request_throughput` | 1000 mixed requests against 200 rules with rate limiting |
 
 ## Logging
 
-Roxy uses structured JSON logging via `tracing`. Set log level with `RUST_LOG`:
-
 ```bash
-# Info level (default) - forwarded requests and actions
 RUST_LOG=info ./target/release/roxy --config config.yaml
-
-# Debug level - rule evaluation details
 RUST_LOG=debug ./target/release/roxy --config config.yaml
-
-# Trace specific modules
 RUST_LOG=roxy::rules=debug,roxy::proxy=info ./target/release/roxy --config config.yaml
 ```
 
-### Smart Header Logging
+## Live Stats
 
-When a rule uses **existence-only header checks** (e.g., `header("X-Customer-Id")` without a value), Roxy automatically logs the actual header value when the rule matches. This is useful for observability without cluttering logs when headers aren't relevant to the rule.
+A bundled bash script parses roxy's JSON log output in real time and displays a refreshing dashboard with traffic statistics.
 
-**Example rule:**
-```yaml
-rules:
-  - name: "track-customer"
-    rule: 'header("X-Customer-Id") && path("/api/*") = pass'
+```bash
+docker logs -f <container> 2>&1 | ./scripts/live-stats.sh
 ```
 
-**Log output:**
-```json
-{"method":"GET","host":"api.example.com","path":"/api/users","rule":"track-customer","action":"forward","headers":{"X-Customer-Id":"cust-12345"}}
-```
+Tracks:
+- **Paths** — Top 20 paths by hit count
+- **Rules** — Requests per matched rule
+- **Rate limited** — Requests rejected with 429 (rate limit)
+- **Credit exhausted** — Requests rejected with 429 (credit budget)
+- **Errors** — Grouped by level and message type
 
-**What gets logged:**
-- `header("X-Name")` - existence check → **value is logged**
-- `header("X-Name:value")` - value match → **not logged** (value is already in the rule)
-- Multiple headers in a rule → all existence-only headers are logged
+![Live Stats](docs/live-stats.png)
 
-This only adds overhead when headers are actually checked, and the values appear in the single `forward` log line.
+> Requires `jq`. Install with `apt install jq` or `brew install jq`.
+
+## Documentation
+
+| Topic | Link |
+|-------|------|
+| Rule DSL syntax, matchers, operators, actions | [docs/rules.md](docs/rules.md) |
+| Rate limiting, credits, throttling | [docs/rate-limiting.md](docs/rate-limiting.md) |
+| Memory tuning, jemalloc, connection pool | [docs/memory-tuning.md](docs/memory-tuning.md) |
 
 ## License
 
