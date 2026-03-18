@@ -53,6 +53,12 @@ pub struct ProxyConfig {
     /// Credit and rate limit state is preserved across reloads.
     #[serde(default = "default_reload_interval_secs")]
     pub reload_interval_secs: u64,
+
+    /// Skip TLS certificate verification for upstream servers (default: false).
+    /// When true, the proxy accepts any upstream certificate including self-signed.
+    /// WARNING: This disables all upstream TLS security. Use only in trusted networks.
+    #[serde(default)]
+    pub unsafe_skip_verify: bool,
 }
 
 fn default_reload_interval_secs() -> u64 {

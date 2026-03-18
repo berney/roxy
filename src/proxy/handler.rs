@@ -10,6 +10,7 @@ use hudsucker::{
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::error::Error as _;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
@@ -875,6 +876,36 @@ impl HttpHandler for RoxyHandler {
         }
 
         Response::from_parts(parts, body)
+    }
+
+    async fn handle_error(
+        &mut self,
+        _ctx: &HttpContext,
+        err: hyper_util::client::legacy::Error,
+    ) -> Response<Body> {
+        // Walk the error source chain to surface the actual root cause.
+        // The default handler only logs the top-level "client error (Connect)"
+        // which hides DNS failures, TCP refused, TLS errors, etc.
+        let mut cause = String::new();
+        let mut source: Option<&dyn std::error::Error> = err.source();
+        while let Some(e) = source {
+            if !cause.is_empty() {
+                cause.push_str(" → ");
+            }
+            cause.push_str(&e.to_string());
+            source = e.source();
+        }
+
+        if cause.is_empty() {
+            error!(target: "proxy", error = %err, "Failed to forward request");
+        } else {
+            error!(target: "proxy", error = %err, cause = %cause, "Failed to forward request");
+        }
+
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::empty())
+            .expect("Failed to build response")
     }
 }
 
