@@ -12,6 +12,12 @@ reload_interval_secs: 5
 #   ca_key: "./ca.key"
 #   cert_cache_size: 1000
 
+# Skip TLS certificate verification for upstream servers (default: false).
+# WARNING: Disables ALL upstream certificate validation. Self-signed and
+# invalid certificates will be accepted. Only use in trusted networks
+# or development environments where upstream servers use self-signed certs.
+# unsafe_skip_verify: true
+
 # Connection pool settings (optional)
 # Limits prevent unbounded memory growth and mitigate DoS attacks
 pool:

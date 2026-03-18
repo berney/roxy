@@ -10,7 +10,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use hudsucker::{
     rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose},
-    rustls::crypto::aws_lc_rs,
+    rustls::{ClientConfig, crypto::aws_lc_rs},
     Proxy,
 };
 use hyper_util::client::legacy::Builder as ClientBuilder;
@@ -405,17 +405,55 @@ async fn main() {
     );
 
     // Build and start proxy
-    let proxy = Proxy::builder()
-        .with_addr(addr)
-        .with_ca(ca)
-        .with_rustls_connector(aws_lc_rs::default_provider())
-        .with_client(client_builder)
-        .with_http_handler(handler)
-        .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))
-        .build()
-        .expect("Failed to create proxy");
+    let result = if config.unsafe_skip_verify {
+        warn!(
+            target: "proxy",
+            "Upstream TLS verification DISABLED — self-signed and invalid certificates will be accepted"
+        );
 
-    if let Err(e) = proxy.start().await {
+        let provider = Arc::new(aws_lc_rs::default_provider());
+        let rustls_config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("Failed to configure TLS protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                roxy::proxy::NoVerifier::new(provider),
+            ))
+            .with_no_client_auth();
+
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(rustls_config)
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+
+        Proxy::builder()
+            .with_addr(addr)
+            .with_ca(ca)
+            .with_http_connector(connector)
+            .with_client(client_builder)
+            .with_http_handler(handler)
+            .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))
+            .build()
+            .expect("Failed to create proxy")
+            .start()
+            .await
+    } else {
+        Proxy::builder()
+            .with_addr(addr)
+            .with_ca(ca)
+            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_client(client_builder)
+            .with_http_handler(handler)
+            .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))
+            .build()
+            .expect("Failed to create proxy")
+            .start()
+            .await
+    };
+
+    if let Err(e) = result {
         error!(target: "proxy", error = %e, "Proxy error");
         std::process::exit(1);
     }
