@@ -31,8 +31,7 @@ impl<const N: usize> StackString<N> {
     /// so this conversion cannot fail in practice.
     #[inline]
     pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.buf[..self.len])
-            .expect("BUG: StackString contains invalid UTF-8")
+        std::str::from_utf8(&self.buf[..self.len]).expect("BUG: StackString contains invalid UTF-8")
     }
 
     /// Push a `&str` directly (faster than going through `fmt::Write`
@@ -60,7 +59,6 @@ impl<const N: usize> StackString<N> {
         self.len += 1;
         Ok(())
     }
-
 }
 
 impl<const N: usize> Write for StackString<N> {

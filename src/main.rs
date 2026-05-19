@@ -9,9 +9,9 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use hudsucker::{
+    Proxy,
     rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose},
     rustls::{ClientConfig, crypto::aws_lc_rs},
-    Proxy,
 };
 use hyper_util::client::legacy::Builder as ClientBuilder;
 use hyper_util::rt::TokioExecutor;
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use arc_swap::ArcSwap;
 use roxy::config::ProxyConfig;
@@ -54,7 +54,8 @@ impl Args {
             std::process::exit(0);
         }
 
-        let config_path = if let Some(pos) = args.iter().position(|a| a == "--config" || a == "-c") {
+        let config_path = if let Some(pos) = args.iter().position(|a| a == "--config" || a == "-c")
+        {
             args.get(pos + 1)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("config.yaml"))
@@ -70,8 +71,7 @@ impl Args {
 
 fn setup_logging() {
     // Set up tracing with JSON output
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -106,18 +106,17 @@ fn create_ca(config: &ProxyConfig) -> RoxyAuthority {
                 }
             }
         }
-        
+
         let cert_pem = std::fs::read_to_string(&tls_config.ca_cert)
             .unwrap_or_else(|e| {
                 error!(target: "proxy", path = %tls_config.ca_cert.display(), error = %e, "Failed to read CA cert");
                 std::process::exit(1);
             });
 
-        let key_pair = KeyPair::from_pem(&key_pem)
-            .unwrap_or_else(|e| {
-                error!(target: "proxy", error = %e, "Failed to parse CA key");
-                std::process::exit(1);
-            });
+        let key_pair = KeyPair::from_pem(&key_pem).unwrap_or_else(|e| {
+            error!(target: "proxy", error = %e, "Failed to parse CA key");
+            std::process::exit(1);
+        });
 
         let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert_pem, key_pair)
             .unwrap_or_else(|e| {
@@ -126,11 +125,16 @@ fn create_ca(config: &ProxyConfig) -> RoxyAuthority {
             });
 
         info!(target: "proxy", "Loaded CA from config");
-        RoxyAuthority::new(issuer, &cert_pem, tls_config.cert_cache_size as u64, aws_lc_rs::default_provider())
+        RoxyAuthority::new(
+            issuer,
+            &cert_pem,
+            tls_config.cert_cache_size as u64,
+            aws_lc_rs::default_provider(),
+        )
     } else {
         // Generate ephemeral CA
         info!(target: "proxy", "Generating ephemeral CA (use tls config for persistent CA)");
-        
+
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "Roxy Proxy CA");
@@ -140,9 +144,11 @@ fn create_ca(config: &ProxyConfig) -> RoxyAuthority {
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
         let key_pair = KeyPair::generate().expect("Failed to generate CA key");
-        let cert = params.self_signed(&key_pair).expect("Failed to generate CA cert");
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("Failed to generate CA cert");
         let cert_pem = cert.pem();
-        
+
         let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert_pem, key_pair)
             .expect("Failed to create issuer from generated CA");
 
@@ -341,11 +347,7 @@ async fn main() {
     });
 
     // Build hot-reloadable shared config (rules + headers + throttle)
-    let shared_config = SharedConfig::new(
-        rules,
-        config.headers.clone(),
-        config.throttle.clone(),
-    );
+    let shared_config = SharedConfig::new(rules, config.headers.clone(), config.throttle.clone());
     let shared_config = Arc::new(ArcSwap::from_pointee(shared_config));
 
     // Create handler
@@ -416,17 +418,19 @@ async fn main() {
             .with_safe_default_protocol_versions()
             .expect("Failed to configure TLS protocol versions")
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(
-                roxy::proxy::NoVerifier::new(provider),
-            ))
+            .with_custom_certificate_verifier(Arc::new(roxy::proxy::NoVerifier::new(provider)))
             .with_no_client_auth();
+
+        // Inject custom HTTP connector with 15s TCP Keepalive to kill zombie connections
+        let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        http_connector.set_keepalive(Some(Duration::from_secs(15)));
 
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(rustls_config)
             .https_or_http()
             .enable_http1()
             .enable_http2()
-            .build();
+            .wrap_connector(http_connector);
 
         Proxy::builder()
             .with_addr(addr)
@@ -440,10 +444,21 @@ async fn main() {
             .start()
             .await
     } else {
+        // Safe Mode: Inject custom HTTP connector with 15s TCP Keepalive
+        let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        http_connector.set_keepalive(Some(Duration::from_secs(15)));
+
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots() // <--- CHANGED THIS LINE
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(http_connector);
+
         Proxy::builder()
             .with_addr(addr)
             .with_ca(ca)
-            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_http_connector(connector)
             .with_client(client_builder)
             .with_http_handler(handler)
             .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))

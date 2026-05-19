@@ -26,7 +26,9 @@ pub enum ConfigError {
 /// Each variant includes the rule name for easy identification in multi-rule configs.
 #[derive(Debug, Error)]
 pub enum ParseError {
-    #[error("Rule '{rule_name}': unexpected input at position {position} — expected {expected}, got '{actual}'")]
+    #[error(
+        "Rule '{rule_name}': unexpected input at position {position} — expected {expected}, got '{actual}'"
+    )]
     UnexpectedToken {
         rule_name: String,
         position: usize,
@@ -45,28 +47,16 @@ pub enum ParseError {
     },
 
     #[error("Rule '{rule_name}': unknown HTTP method '{method}'")]
-    InvalidMethod {
-        rule_name: String,
-        method: String,
-    },
+    InvalidMethod { rule_name: String, method: String },
 
     #[error("Rule '{rule_name}': invalid action combination — {detail}")]
-    InvalidActionCombination {
-        rule_name: String,
-        detail: String,
-    },
+    InvalidActionCombination { rule_name: String, detail: String },
 
     #[error("Rule '{rule_name}': {detail}")]
-    InvalidValue {
-        rule_name: String,
-        detail: String,
-    },
+    InvalidValue { rule_name: String, detail: String },
 
     #[error("Rule '{rule_name}': {detail}")]
-    Other {
-        rule_name: String,
-        detail: String,
-    },
+    Other { rule_name: String, detail: String },
 }
 
 #[cfg(test)]

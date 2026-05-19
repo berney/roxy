@@ -10,10 +10,10 @@ jemalloc actively defragments and returns unused pages, keeping RSS proportional
 
 ### Aggressive Memory Return
 
-For memory-constrained environments, you can make jemalloc more aggressive about returning memory to the OS by setting the `MALLOC_CONF` environment variable:
+For memory-constrained environments, you can make jemalloc more aggressive about returning memory to the OS by setting the `_RJEM_MALLOC_CONF` environment variable:
 
 ```bash
-MALLOC_CONF="background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000" ./target/release/roxy --config config.yaml
+_RJEM_MALLOC_CONF="background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000" ./target/release/roxy --config config.yaml
 ```
 
 | Option | Default | Recommended | Effect |
@@ -31,7 +31,7 @@ services:
   roxy:
     image: adsanz/roxy:latest
     environment:
-      - MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000
+      - _RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000
     ports:
       - "8080:8080"
     volumes:
