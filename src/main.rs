@@ -423,6 +423,7 @@ async fn main() {
 
         // Inject custom HTTP connector with 15s TCP Keepalive to kill zombie connections
         let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        http_connector.enforce_http(false);
         http_connector.set_keepalive(Some(Duration::from_secs(15)));
 
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
@@ -446,6 +447,7 @@ async fn main() {
     } else {
         // Safe Mode: Inject custom HTTP connector with 15s TCP Keepalive
         let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        http_connector.enforce_http(false);
         http_connector.set_keepalive(Some(Duration::from_secs(15)));
 
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
